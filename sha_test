@@ -1,0 +1,1480 @@
+class sha3_384_test extends sha3_base_test;
+
+    `uvm_component_utils(sha3_384_test)
+
+    // ============================================================
+    // SHA3-384 固定參數
+    // SHA3-384 fixed parameters
+    // ============================================================
+
+    localparam int SHA3_RATE_BYTES   = 104;
+    // SHA3-384 的 rate = 832 bits = 104 bytes
+    // SHA3-384 has a rate of 832 bits = 104 bytes
+
+    localparam int SHA3_DIGEST_BYTES = 48;
+    // SHA3-384 的 digest = 384 bits = 48 bytes
+    // SHA3-384 digest size is 384 bits = 48 bytes
+
+
+    // ============================================================
+    // Regression 設定
+    // Regression configuration
+    // ============================================================
+
+    int unsigned num_test = 30;
+    // 跟你舊 STM 一樣，先跑 30 筆 random testcase
+    // Same idea as your legacy STM: start with 30 random testcases
+
+    int pass_cnt;
+    int fail_cnt;
+    // 用來統計 PASS / FAIL 數量
+    // Used to count PASS / FAIL results
+
+
+    // ============================================================
+    // Test data
+    // Test data
+    // ============================================================
+
+    byte unsigned sha_data[];
+    // 用 dynamic byte array 儲存真正要 hash 的 message
+    // 使用 byte array 比用超大的 packed vector 安全很多
+    // 因為不會掉 leading zero byte
+    //
+    // Use a dynamic byte array to store the real message.
+    // This is safer than a huge packed vector because leading
+    // zero bytes are preserved.
+
+    int unsigned sha_data_len_byte;
+    // message 長度，單位是 byte
+    // Message length in bytes
+
+    int unsigned sha_data_len_bit;
+    // message 長度，單位是 bit
+    // Message length in bits
+
+    bit [1:0] block_wr_num;
+    // legacy Python / STM 裡的 block_wr_num
+    //
+    // 0 -> 每次寫 1 byte
+    // 1 -> 每次寫 2 bytes
+    // 2 -> 每次寫 3 bytes
+    // 3 -> 每次寫 4 bytes
+    //
+    // Legacy block_wr_num:
+    //
+    // 0 -> 1 byte per write
+    // 1 -> 2 bytes per write
+    // 2 -> 3 bytes per write
+    // 3 -> 4 bytes per write
+
+    bit [383:0] expected_digest;
+    // SV golden model 算出的 SHA3-384
+    // SHA3-384 calculated by the SV golden model
+
+    bit [383:0] actual_digest;
+    // DUT 真正算出來的 SHA3-384
+    // SHA3-384 actually produced by the DUT
+
+
+
+    // ============================================================
+    // Constructor
+    // ============================================================
+
+    function new(
+        string name = "sha3_384_test",
+        uvm_component parent = null
+    );
+
+        super.new(name, parent);
+
+    endfunction
+
+
+
+    // ============================================================
+    // Main run phase
+    // 主 testcase flow
+    // ============================================================
+
+    task run_phase(uvm_phase phase);
+
+        phase.raise_objection(this);
+        // 告訴 UVM：test 還沒跑完，不要結束 simulation
+        // Tell UVM that the test is still running
+
+
+        pass_cnt = 0;
+        fail_cnt = 0;
+
+
+        // --------------------------------------------------------
+        // 先驗證 golden model 本身
+        // --------------------------------------------------------
+        //
+        // 如果 reference model 自己就錯，
+        // 那後面拿它去比 DUT 就沒有意義
+        //
+        // Verify the golden model itself first.
+        // If the reference model is wrong,
+        // comparing the DUT against it is meaningless.
+        // --------------------------------------------------------
+
+        sha3_384_self_test();
+
+
+        // --------------------------------------------------------
+        // Main random regression
+        // --------------------------------------------------------
+
+        for (int tc = 0; tc < num_test; tc++) begin
+
+            `uvm_info(
+                "SHA3_TEST",
+                $sformatf(
+                    "\n========== SHA3-384 TESTCASE %0d ==========",
+                    tc
+                ),
+                UVM_LOW
+            )
+
+
+            // ====================================================
+            // 1. 產生 random message
+            // ====================================================
+
+            gen_random_message();
+
+
+            // ====================================================
+            // 2. 用純 SV golden model 算 expected digest
+            // ====================================================
+
+            sha3_384(
+                sha_data,
+                expected_digest
+            );
+
+
+            // ====================================================
+            // 3. 設定 DUT
+            // ====================================================
+
+            configure_sha3_384();
+
+
+            // ====================================================
+            // 4. 把 message 寫進 DUT
+            //
+            // 這段取代 legacy 的 sha256_in_h1()
+            // ====================================================
+
+            write_sha3_message();
+
+
+            // ====================================================
+            // 5. 啟動 SHA3 計算
+            // ====================================================
+
+            start_sha3();
+
+
+            // ====================================================
+            // 6. 等待 DUT 計算完成
+            // ====================================================
+
+            wait_sha3_done();
+
+
+            // ====================================================
+            // 7. 把 DUT digest 讀回來
+            // ====================================================
+
+            read_sha3_digest(
+                actual_digest
+            );
+
+
+            // ====================================================
+            // 8. 比對 expected / actual
+            // ====================================================
+
+            compare_result(tc);
+
+        end
+
+
+        // ========================================================
+        // Regression summary
+        // ========================================================
+
+        `uvm_info(
+            "SHA3_REPORT",
+            $sformatf(
+                {
+                    "\n====================================",
+                    "\n SHA3-384 regression finished",
+                    "\n Total : %0d",
+                    "\n PASS  : %0d",
+                    "\n FAIL  : %0d",
+                    "\n===================================="
+                },
+                num_test,
+                pass_cnt,
+                fail_cnt
+            ),
+            UVM_NONE
+        )
+
+
+        if (fail_cnt != 0) begin
+
+            `uvm_error(
+                "SHA3_REPORT",
+                $sformatf(
+                    "%0d SHA3-384 testcase failed",
+                    fail_cnt
+                )
+            )
+
+        end
+
+
+        phase.drop_objection(this);
+        // 告訴 UVM：test 跑完，可以結束 simulation
+        // Tell UVM that the test is complete
+
+    endtask
+
+
+
+    // ============================================================
+    // Random message generation
+    // 產生 random message
+    // ============================================================
+
+    task automatic gen_random_message();
+
+        // --------------------------------------------------------
+        // 對應 Python：
+        //
+        // sha_data_len_byte = random.randint(0, 2**10)
+        //
+        // 所以長度範圍是 0 ~ 1024 bytes
+        // --------------------------------------------------------
+
+        sha_data_len_byte =
+            $urandom_range(1024, 0);
+
+
+        sha_data_len_bit =
+            sha_data_len_byte * 8;
+
+
+        // 建立 dynamic array
+        // Create dynamic array
+
+        sha_data =
+            new[sha_data_len_byte];
+
+
+        // --------------------------------------------------------
+        // 每個 byte 都 random 0x00 ~ 0xFF
+        // --------------------------------------------------------
+
+        foreach (sha_data[i]) begin
+
+            sha_data[i] =
+                $urandom_range(8'hFF, 8'h00);
+
+        end
+
+
+        // --------------------------------------------------------
+        // 根據 legacy Python 規則決定 block_wr_num
+        // --------------------------------------------------------
+
+        block_wr_num =
+            calc_block_wr_num(
+                sha_data_len_byte
+            );
+
+
+        `uvm_info(
+            "SHA3_RANDOM",
+            $sformatf(
+                "len_byte=%0d len_bit=%0d block_wr_num=%0d",
+                sha_data_len_byte,
+                sha_data_len_bit,
+                block_wr_num
+            ),
+            UVM_MEDIUM
+        )
+
+    endtask
+
+
+
+    // ============================================================
+    // 計算 block_wr_num
+    // Calculate block_wr_num
+    // ============================================================
+
+    function automatic bit [1:0] calc_block_wr_num(
+        input int unsigned len_byte
+    );
+
+        // --------------------------------------------------------
+        // 完全照你照片裡的 SHA_test_gen.py：
+        //
+        // if len/8 % 4 == 0:
+        //     block_wr_num = 3
+        // elif len/8 % 3 == 0:
+        //     block_wr_num = 2
+        // elif len/8 % 2 == 0:
+        //     block_wr_num = 1
+        // else:
+        //     block_wr_num = 0
+        //
+        // 因為這裡 len_byte 已經是 byte 數，
+        // 所以直接對 len_byte 做 %
+        // --------------------------------------------------------
+
+        if ((len_byte % 4) == 0)
+            return 2'd3;
+
+        else if ((len_byte % 3) == 0)
+            return 2'd2;
+
+        else if ((len_byte % 2) == 0)
+            return 2'd1;
+
+        else
+            return 2'd0;
+
+    endfunction
+
+
+
+    // ============================================================
+    // 設定 SHA3-384
+    // Configure SHA3-384
+    // ============================================================
+
+    task automatic configure_sha3_384();
+
+        bit [31:0] wdata;
+
+
+        wdata = '0;
+
+
+        // --------------------------------------------------------
+        // legacy STM 有：
+        //
+        // system.apb_write(
+        //     {24'h1005_2d, 6'h30, 2'h0},
+        //     block_wr_num
+        // );
+        //
+        // 所以 block_wr_num 是寫到這個 register 的低兩 bit
+        // --------------------------------------------------------
+
+        wdata[1:0] =
+            block_wr_num;
+
+
+        dut_apb_write(
+            {24'h1005_2d, 6'h30, 2'h0},
+            wdata
+        );
+
+
+        // --------------------------------------------------------
+        // TODO：
+        //
+        // SHA3-384 mode register 還需要看你的 spec / legacy code
+        //
+        // 目前不能亂猜，例如可能是：
+        //
+        // mode = 2'b10
+        //
+        // 但一定要先確認 register address 和 bit field
+        // --------------------------------------------------------
+
+    endtask
+
+
+
+    // ============================================================
+    // 寫 message 到 DUT
+    //
+    // 這一段是 1:1 取代你貼的 sha256_in_h1()
+    // ============================================================
+
+    task automatic write_sha3_message();
+
+        int bytes_per_write;
+        // 每次 APB write 寫幾個 byte
+        // Number of bytes per APB write
+
+        int idx;
+        // 目前 message byte index
+        // Current message byte index
+
+        bit [31:0] pwdata;
+        // 一次送出去的 32-bit APB data
+        // 32-bit APB write data
+
+
+        // --------------------------------------------------------
+        // block_wr_num：
+        //
+        // 0 -> 1 byte
+        // 1 -> 2 bytes
+        // 2 -> 3 bytes
+        // 3 -> 4 bytes
+        //
+        // 所以 bytes_per_write = block_wr_num + 1
+        // --------------------------------------------------------
+
+        bytes_per_write =
+            int'(block_wr_num) + 1;
+
+
+        // ========================================================
+        // legacy 第一段：
+        //
+        // paddress <= {24'h1005_2d,6'h3f,2'h0};
+        // pwdata   <= {24'b0,8'd4};
+        //
+        // comment 是 MCU_ACCESS_EN
+        //
+        // 也就是正式送 data 前先寫 0x04
+        // ========================================================
+
+        dut_apb_write(
+            {24'h1005_2d, 6'h3f, 2'h0},
+            32'h0000_0004
+        );
+
+
+        idx = 0;
+
+
+        // ========================================================
+        // 開始把整包 message 切成 1/2/3/4 bytes 寫入
+        // ========================================================
+
+        while (idx < sha_data.size()) begin
+
+            pwdata = 32'h0;
+            // 每次先清 0，避免上一次 write 殘值留下來
+            // Clear the word before every write
+
+
+            // ----------------------------------------------------
+            // legacy packing：
+            //
+            // 第一個 message byte -> pwdata[7:0]
+            // 第二個 message byte -> pwdata[15:8]
+            // 第三個 message byte -> pwdata[23:16]
+            // 第四個 message byte -> pwdata[31:24]
+            //
+            // 例如：
+            //
+            // message = A3 B4 C5 D6
+            //
+            // APB data = 32'hD6C5B4A3
+            //
+            // 注意：
+            // 這不是把 message reverse，
+            // 而是第一個 byte 放 lowest byte lane
+            // ----------------------------------------------------
+
+            for (
+                int byte_idx = 0;
+                byte_idx < bytes_per_write;
+                byte_idx++
+            ) begin
+
+                if ((idx + byte_idx) < sha_data.size()) begin
+
+                    pwdata[
+                        byte_idx*8 +: 8
+                    ] =
+                        sha_data[
+                            idx + byte_idx
+                        ];
+
+                end
+
+            end
+
+
+            // ----------------------------------------------------
+            // legacy data write address：
+            //
+            // paddress <= {24'h1005_2d,6'h35,2'h0};
+            // ----------------------------------------------------
+
+            dut_apb_write(
+                {24'h1005_2d, 6'h35, 2'h0},
+                pwdata
+            );
+
+
+            `uvm_info(
+                "SHA3_DATA_WRITE",
+                $sformatf(
+                    "idx=%0d pwdata=%08h bytes_per_write=%0d",
+                    idx,
+                    pwdata,
+                    bytes_per_write
+                ),
+                UVM_HIGH
+            )
+
+
+            idx += bytes_per_write;
+
+        end
+
+
+        // ========================================================
+        // legacy 最後：
+        //
+        // paddress <= {24'h1005_2d,6'h3f,2'h0};
+        // pwdata   <= {24'b0,8'd8};
+        //
+        // comment = FW block write end
+        //
+        // 表示 message write 結束
+        // ========================================================
+
+        dut_apb_write(
+            {24'h1005_2d, 6'h3f, 2'h0},
+            32'h0000_0008
+        );
+
+    endtask
+
+
+
+    // ============================================================
+    // 啟動 SHA3
+    // Start SHA3
+    // ============================================================
+
+    task automatic start_sha3();
+
+        bit [31:0] start_data;
+
+
+        // --------------------------------------------------------
+        // 從你第一張 legacy STM 圖看到：
+        //
+        // system.apb_write(
+        //     {24'h1005_2d,6'h24,2'h0},
+        //     {1'b0,1'b1,30'h0}
+        // );
+        //
+        // {1'b0,1'b1,30'h0}
+        //
+        // 等於：
+        //
+        // bit[31] = 0
+        // bit[30] = 1
+        // bit[29:0] = 0
+        //
+        // 所以是 32'h4000_0000
+        // --------------------------------------------------------
+
+        start_data =
+            32'h4000_0000;
+
+
+        dut_apb_write(
+            {24'h1005_2d, 6'h24, 2'h0},
+            start_data
+        );
+
+    endtask
+
+
+
+    // ============================================================
+    // 等待 SHA3 完成
+    // Wait for SHA3 completion
+    // ============================================================
+
+    task automatic wait_sha3_done();
+
+        bit [31:0] rdata;
+
+        int unsigned timeout;
+
+
+        timeout = 0;
+
+
+        forever begin
+
+            // ----------------------------------------------------
+            // 你 legacy STM 在 start 後有 read h25
+            //
+            // 所以我先把 h25 當 status read point
+            //
+            // 但哪一個 bit 是 DONE，
+            // 目前照片還看不出來
+            // ----------------------------------------------------
+
+            dut_apb_read(
+                {24'h1005_2d, 6'h25, 2'h0},
+                rdata
+            );
+
+
+            // ----------------------------------------------------
+            // TODO：
+            //
+            // 這裡的 rdata[0] 必須確認是不是 done bit
+            //
+            // 如果 spec 說 done 是 bit[2]，
+            // 就要改成：
+            //
+            // if (rdata[2])
+            //
+            // ----------------------------------------------------
+
+            if (rdata[0] == 1'b1)
+                break;
+
+
+            timeout++;
+
+
+            // ----------------------------------------------------
+            // 防止 DUT 卡住後 test 永遠跑不完
+            // ----------------------------------------------------
+
+            if (timeout >= 100000) begin
+
+                `uvm_fatal(
+                    "SHA3_TIMEOUT",
+                    $sformatf(
+                        "SHA3 timeout, status=%08h",
+                        rdata
+                    )
+                )
+
+            end
+
+
+            #100ns;
+
+        end
+
+    endtask
+
+
+
+    // ============================================================
+    // 讀 DUT digest
+    // Read DUT digest
+    // ============================================================
+
+    task automatic read_sha3_digest(
+        output bit [383:0] digest
+    );
+
+        digest = '0;
+
+
+        // --------------------------------------------------------
+        // legacy code 最後是直接看：
+        //
+        // system.i_sha3_top.digest[511:0]
+        //
+        // SHA3-384 需要取 384 bits
+        //
+        // 但目前還沒看到 mode 與 digest slice 的完整對照
+        //
+        // 所以不能直接亂寫：
+        //
+        // digest = digest[511:128]
+        //
+        // 雖然位寬剛好是 384，
+        // 但一定要以 RTL/spec 為準
+        // --------------------------------------------------------
+
+        // TODO example:
+        //
+        // digest =
+        //     $root.system.i_sha3_top.digest[511:128];
+
+    endtask
+
+
+
+    // ============================================================
+    // Compare expected / actual
+    // 比對 golden 和 DUT
+    // ============================================================
+
+    task automatic compare_result(
+        input int tc
+    );
+
+        if (actual_digest !== expected_digest) begin
+
+            fail_cnt++;
+
+
+            `uvm_error(
+                "SHA3_MISMATCH",
+                $sformatf(
+                    {
+                        "\n======================================",
+                        "\nTC           = %0d",
+                        "\nlen_byte     = %0d",
+                        "\nlen_bit      = %0d",
+                        "\nblock_wr_num = %0d",
+                        "\nexpected     = %096h",
+                        "\nactual       = %096h",
+                        "\n======================================"
+                    },
+                    tc,
+                    sha_data_len_byte,
+                    sha_data_len_bit,
+                    block_wr_num,
+                    expected_digest,
+                    actual_digest
+                )
+            )
+
+        end
+
+        else begin
+
+            pass_cnt++;
+
+
+            `uvm_info(
+                "SHA3_PASS",
+                $sformatf(
+                    "TC=%0d PASS digest=%096h",
+                    tc,
+                    actual_digest
+                ),
+                UVM_LOW
+            )
+
+        end
+
+    endtask
+
+
+
+    // ============================================================
+    // APB write adapter
+    // ============================================================
+
+    task automatic dut_apb_write(
+        input bit [31:0] addr,
+        input bit [31:0] data
+    );
+
+        // --------------------------------------------------------
+        // 這裡請換成你 UVM env 真正的 APB write API
+        //
+        // 例如如果你 base_test 已經有：
+        //
+        // apb_write(addr, data);
+        //
+        // 那這裡直接：
+        //
+        // apb_write(addr, data);
+        //
+        // 如果是 RAL：
+        //
+        // ral.xxx.write(status, data);
+        //
+        // --------------------------------------------------------
+
+    endtask
+
+
+
+    // ============================================================
+    // APB read adapter
+    // ============================================================
+
+    task automatic dut_apb_read(
+        input  bit [31:0] addr,
+        output bit [31:0] data
+    );
+
+        // --------------------------------------------------------
+        // 同上，換成你真正的 APB read API
+        // --------------------------------------------------------
+
+    endtask
+
+
+
+    // ============================================================
+    // 64-bit rotate left
+    //
+    // Keccak Rho step 會用到
+    // ============================================================
+
+    function automatic bit [63:0] rotl64(
+        input bit [63:0] value,
+        input int unsigned sh
+    );
+
+        if (sh == 0)
+            return value;
+
+        return
+            (value << sh)
+            |
+            (value >> (64-sh));
+
+    endfunction
+
+
+
+    // ============================================================
+    // Rho rotation offset
+    //
+    // SHA3 / Keccak-f[1600] 固定 rotation table
+    // ============================================================
+
+    function automatic int unsigned rho_offset(
+        input int x,
+        input int y
+    );
+
+        case (y)
+
+            0:
+                case(x)
+                    0:return 0;
+                    1:return 1;
+                    2:return 62;
+                    3:return 28;
+                    4:return 27;
+                endcase
+
+            1:
+                case(x)
+                    0:return 36;
+                    1:return 44;
+                    2:return 6;
+                    3:return 55;
+                    4:return 20;
+                endcase
+
+            2:
+                case(x)
+                    0:return 3;
+                    1:return 10;
+                    2:return 43;
+                    3:return 25;
+                    4:return 39;
+                endcase
+
+            3:
+                case(x)
+                    0:return 41;
+                    1:return 45;
+                    2:return 15;
+                    3:return 21;
+                    4:return 8;
+                endcase
+
+            4:
+                case(x)
+                    0:return 18;
+                    1:return 2;
+                    2:return 61;
+                    3:return 56;
+                    4:return 14;
+                endcase
+
+        endcase
+
+        return 0;
+
+    endfunction
+
+
+
+    // ============================================================
+    // Keccak-f[1600] round constants
+    // ============================================================
+
+    function automatic bit [63:0] rc(
+        input int round
+    );
+
+        case(round)
+
+             0:return 64'h0000000000000001;
+             1:return 64'h0000000000008082;
+             2:return 64'h800000000000808A;
+             3:return 64'h8000000080008000;
+             4:return 64'h000000000000808B;
+             5:return 64'h0000000080000001;
+             6:return 64'h8000000080008081;
+             7:return 64'h8000000000008009;
+
+             8:return 64'h000000000000008A;
+             9:return 64'h0000000000000088;
+            10:return 64'h0000000080008009;
+            11:return 64'h000000008000000A;
+            12:return 64'h000000008000808B;
+            13:return 64'h800000000000008B;
+            14:return 64'h8000000000008089;
+            15:return 64'h8000000000008003;
+
+            16:return 64'h8000000000008002;
+            17:return 64'h8000000000000080;
+            18:return 64'h000000000000800A;
+            19:return 64'h800000008000000A;
+            20:return 64'h8000000080008081;
+            21:return 64'h8000000000008080;
+            22:return 64'h0000000080000001;
+            23:return 64'h8000000080008008;
+
+        endcase
+
+        return '0;
+
+    endfunction
+
+
+
+    // ============================================================
+    // Keccak-f[1600]
+    //
+    // 一次 permutation 固定做 24 rounds
+    //
+    // 每 round：
+    //
+    // Theta
+    // Rho
+    // Pi
+    // Chi
+    // Iota
+    // ============================================================
+
+    task automatic keccak_f1600(
+        inout bit [63:0] A [0:24]
+    );
+
+        bit [63:0] C [0:4];
+        bit [63:0] D [0:4];
+        bit [63:0] B [0:24];
+
+        int x;
+        int y;
+
+        int new_x;
+        int new_y;
+
+
+        for (
+            int round = 0;
+            round < 24;
+            round++
+        ) begin
+
+
+            // ====================================================
+            // THETA
+            //
+            // 每個 column 的 5 個 lane XOR 起來
+            // ====================================================
+
+            for (x = 0; x < 5; x++) begin
+
+                C[x] =
+                      A[x]
+                    ^ A[x+5]
+                    ^ A[x+10]
+                    ^ A[x+15]
+                    ^ A[x+20];
+
+            end
+
+
+            // ====================================================
+            // 計算每個 column 要 XOR 的 correction value
+            // ====================================================
+
+            for (x = 0; x < 5; x++) begin
+
+                D[x] =
+                      C[(x+4)%5]
+                    ^
+                      rotl64(
+                          C[(x+1)%5],
+                          1
+                      );
+
+            end
+
+
+            // ====================================================
+            // 把 D[x] XOR 到該 column 全部 lane
+            // ====================================================
+
+            for (y = 0; y < 5; y++) begin
+
+                for (x = 0; x < 5; x++) begin
+
+                    A[x+5*y] ^=
+                        D[x];
+
+                end
+
+            end
+
+
+            // ====================================================
+            // RHO + PI
+            //
+            // Rho = rotate
+            // Pi  = relocate lane
+            // ====================================================
+
+            for (x = 0; x < 25; x++)
+                B[x] = '0;
+
+
+            for (y = 0; y < 5; y++) begin
+
+                for (x = 0; x < 5; x++) begin
+
+                    new_x =
+                        y;
+
+                    new_y =
+                        (2*x + 3*y) % 5;
+
+
+                    B[
+                        new_x + 5*new_y
+                    ] =
+                        rotl64(
+                            A[x + 5*y],
+                            rho_offset(x,y)
+                        );
+
+                end
+
+            end
+
+
+            // ====================================================
+            // CHI
+            //
+            // Keccak 唯一主要的 nonlinear step
+            // ====================================================
+
+            for (y = 0; y < 5; y++) begin
+
+                for (x = 0; x < 5; x++) begin
+
+                    A[x + 5*y] =
+                          B[x + 5*y]
+                        ^
+                        (
+                            (~B[
+                                ((x+1)%5)
+                                + 5*y
+                              ])
+                            &
+                            B[
+                                ((x+2)%5)
+                                + 5*y
+                             ]
+                        );
+
+                end
+
+            end
+
+
+            // ====================================================
+            // IOTA
+            //
+            // 把 round constant XOR 到 A[0][0]
+            // ====================================================
+
+            A[0] ^=
+                rc(round);
+
+        end
+
+    endtask
+
+
+
+    // ============================================================
+    // Absorb 一個完整 SHA3-384 block
+    //
+    // 一個 block = 104 bytes
+    // ============================================================
+
+    task automatic absorb_block(
+        inout bit [63:0] A [0:24],
+        input byte unsigned block [0:103]
+    );
+
+        int lane;
+        int byte_pos;
+
+        bit [63:0] temp;
+
+
+        for (
+            int i = 0;
+            i < SHA3_RATE_BYTES;
+            i++
+        ) begin
+
+
+            // ----------------------------------------------------
+            // 每 8 bytes 組成一個 64-bit lane
+            // ----------------------------------------------------
+
+            lane =
+                i / 8;
+
+            byte_pos =
+                i % 8;
+
+
+            // ----------------------------------------------------
+            // SHA3 lane 是 little-endian
+            //
+            // block[0] -> lane[7:0]
+            // block[1] -> lane[15:8]
+            // ...
+            // ----------------------------------------------------
+
+            temp =
+                {56'h0, block[i]};
+
+
+            A[lane] ^=
+                temp << (byte_pos * 8);
+
+        end
+
+
+        // absorb 完一個 block 後，
+        // 執行一次 Keccak-f[1600]
+        // After absorbing one block,
+        // execute one Keccak-f[1600] permutation
+
+        keccak_f1600(A);
+
+    endtask
+
+
+
+    // ============================================================
+    // SHA3-384 golden model
+    // ============================================================
+
+    task automatic sha3_384(
+        input byte unsigned msg[],
+        output bit [383:0] digest
+    );
+
+        bit [63:0] A [0:24];
+        // 1600-bit Keccak state
+        //
+        // 25 * 64 = 1600
+
+        byte unsigned block [0:103];
+        // SHA3-384 rate block = 104 bytes
+
+        byte unsigned digest_byte [0:47];
+        // SHA3-384 digest = 48 bytes
+
+        int offset;
+        int remain;
+
+        int lane;
+        int byte_pos;
+
+
+        // ========================================================
+        // 1. 初始化 state = 0
+        // ========================================================
+
+        for (int i = 0; i < 25; i++)
+            A[i] = '0;
+
+
+        offset = 0;
+
+
+        // ========================================================
+        // 2. Absorb 所有完整 104-byte block
+        // ========================================================
+
+        while (
+            (msg.size() - offset)
+            >= SHA3_RATE_BYTES
+        ) begin
+
+
+            for (
+                int i = 0;
+                i < SHA3_RATE_BYTES;
+                i++
+            ) begin
+
+                block[i] =
+                    msg[offset + i];
+
+            end
+
+
+            absorb_block(
+                A,
+                block
+            );
+
+
+            offset +=
+                SHA3_RATE_BYTES;
+
+        end
+
+
+        // ========================================================
+        // 3. 最後一個 block + padding
+        // ========================================================
+
+        for (
+            int i = 0;
+            i < SHA3_RATE_BYTES;
+            i++
+        ) begin
+
+            block[i] =
+                8'h00;
+
+        end
+
+
+        remain =
+            msg.size() - offset;
+
+
+        for (
+            int i = 0;
+            i < remain;
+            i++
+        ) begin
+
+            block[i] =
+                msg[offset + i];
+
+        end
+
+
+        // --------------------------------------------------------
+        // SHA3 domain separator
+        //
+        // SHA-3 使用 0x06
+        // --------------------------------------------------------
+
+        block[remain] ^=
+            8'h06;
+
+
+        // --------------------------------------------------------
+        // pad10*1 最後一個 bit
+        //
+        // 最後 rate byte 的 MSB 設為 1
+        // --------------------------------------------------------
+
+        block[
+            SHA3_RATE_BYTES - 1
+        ] ^=
+            8'h80;
+
+
+        absorb_block(
+            A,
+            block
+        );
+
+
+        // ========================================================
+        // 4. Squeeze 前 48 bytes
+        // ========================================================
+
+        for (
+            int i = 0;
+            i < SHA3_DIGEST_BYTES;
+            i++
+        ) begin
+
+            lane =
+                i / 8;
+
+            byte_pos =
+                i % 8;
+
+
+            digest_byte[i] =
+                A[lane][
+                    byte_pos*8 +: 8
+                ];
+
+        end
+
+
+        // ========================================================
+        // 5. Pack 成 bit[383:0]
+        //
+        // 目的是讓：
+        //
+        // $display("%096h", digest)
+        //
+        // 顯示順序跟 Python hexdigest() 一樣
+        // ========================================================
+
+        digest = '0;
+
+
+        for (
+            int i = 0;
+            i < SHA3_DIGEST_BYTES;
+            i++
+        ) begin
+
+            digest[
+                383 - i*8 -: 8
+            ] =
+                digest_byte[i];
+
+        end
+
+    endtask
+
+
+
+    // ============================================================
+    // Golden model self test
+    // ============================================================
+
+    task automatic sha3_384_self_test();
+
+        byte unsigned msg[];
+
+        bit [383:0] result;
+
+
+        // ========================================================
+        // Test vector #1
+        //
+        // SHA3-384("")
+        // ========================================================
+
+        msg =
+            new[0];
+
+
+        sha3_384(
+            msg,
+            result
+        );
+
+
+        if (
+            result !==
+            384'h0c63a75b845e4f7d01107d852e4c2485
+                 c51a50aaaa94fc61995e71bbee983a2a
+                 c3713831264adb47fb6bd1e058d5f004
+        ) begin
+
+            `uvm_fatal(
+                "SHA3_REF",
+                $sformatf(
+                    "SHA3-384(empty) failed: %096h",
+                    result
+                )
+            )
+
+        end
+
+
+        // ========================================================
+        // Test vector #2
+        //
+        // SHA3-384("abc")
+        // ========================================================
+
+        msg =
+            new[3];
+
+
+        msg[0] =
+            8'h61;
+        // 'a'
+
+        msg[1] =
+            8'h62;
+        // 'b'
+
+        msg[2] =
+            8'h63;
+        // 'c'
+
+
+        sha3_384(
+            msg,
+            result
+        );
+
+
+        if (
+            result !==
+            384'hec01498288516fc926459f58e2c6ad8d
+                 f9b473cb0fc08c2596da7cf0e49be4b2
+                 98d88cea927ac7f539f1edf228376d25
+        ) begin
+
+            `uvm_fatal(
+                "SHA3_REF",
+                $sformatf(
+                    "SHA3-384(abc) failed: %096h",
+                    result
+                )
+            )
+
+        end
+
+
+        `uvm_info(
+            "SHA3_REF",
+            "SHA3-384 reference model self-test PASS",
+            UVM_LOW
+        )
+
+    endtask
+
+
+endclass
