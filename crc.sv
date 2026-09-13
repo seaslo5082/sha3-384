@@ -1,6 +1,7 @@
 `ifndef HOST_CRC_IP_TEST
 `define HOST_CRC_IP_TEST
 
+
 class host_crc_ip_test extends host_base_test;
 
     `uvm_component_utils(host_crc_ip_test)
@@ -48,7 +49,7 @@ class host_crc_ip_test extends host_base_test;
 
 
     //============================================================
-    // VARIABLES
+    // Variables
     //============================================================
 
     logic [23:0] crc_page_addr;
@@ -58,7 +59,7 @@ class host_crc_ip_test extends host_base_test;
 
 
     //============================================================
-    // NEW
+    // Constructor
     //============================================================
 
     function new(
@@ -72,7 +73,7 @@ class host_crc_ip_test extends host_base_test;
 
 
     //============================================================
-    // BUILD PHASE
+    // Build Phase
     //============================================================
 
     virtual function void build_phase(uvm_phase phase);
@@ -96,6 +97,7 @@ class host_crc_ip_test extends host_base_test;
 
         int unsigned word_num;
 
+
         super.run_phase(phase);
 
         phase.raise_objection(this);
@@ -105,7 +107,8 @@ class host_crc_ip_test extends host_base_test;
         // CRC register page
         //--------------------------------------------------------
 
-        crc_page_addr = h_host_top_cfg.crc_page_addr;
+        crc_page_addr =
+            h_host_top_cfg.crc_page_addr;
 
 
         //--------------------------------------------------------
@@ -116,9 +119,25 @@ class host_crc_ip_test extends host_base_test;
 
 
         //========================================================
+        //
+        // STEP 0
+        //
+        // SELF TEST
+        //
+        // Before touching DUT CRC hardware,
+        // first prove our own golden CRC model is correct.
+        //
+        //========================================================
+
+        crc16_self_test();
+
+
+        //========================================================
+        //
         // STEP 1
         //
-        // Generate valid CRC address range.
+        // Generate valid CRC memory range.
+        //
         //========================================================
 
         gen_crc_range(
@@ -141,10 +160,14 @@ class host_crc_ip_test extends host_base_test;
 
 
         //========================================================
+        //
         // STEP 2
         //
-        // Write known random data into exactly the same
-        // address range that DUT CRC will later read.
+        // Prepare memory.
+        //
+        // Write known random data into exactly the same addresses
+        // that DUT CRC will later read.
+        //
         //========================================================
 
         prepare_crc_memory(
@@ -154,21 +177,26 @@ class host_crc_ip_test extends host_base_test;
 
 
         //========================================================
+        //
         // STEP 3
         //
-        // Generate initial CRC seed.
+        // Generate random CRC seed.
+        //
         //========================================================
 
-        seed = $urandom;
+        seed =
+            $urandom;
 
 
         //========================================================
+        //
         // STEP 4
         //
-        // Read SAME memory range back.
+        // Read same memory addresses back.
         //
-        // 1. Check readback data
+        // 1. Verify memory content
         // 2. Calculate golden CRC
+        //
         //========================================================
 
         readback_crc_memory_and_calc_golden(
@@ -192,95 +220,88 @@ class host_crc_ip_test extends host_base_test;
 
         //========================================================
         //
-        // CASE 1 : CRC MATCH
+        // CASE 1
+        //
+        // NORMAL CRC MATCH
         //
         // EXP == GOLDEN
         //
         // Expected:
         //
-        // ACT_CHECKSUM    == GOLDEN
-        // CHKSUM_MISMATCH == 0
+        // ACT == GOLDEN
+        // mismatch == 0
         //
         //========================================================
 
         run_crc_check_case(
-            .case_name          ("CRC_MATCH"),
-            .start_addr         (start_addr),
-            .end_addr           (end_addr),
-            .seed               (seed),
-            .exp_checksum       (golden_crc),
-            .golden_crc         (golden_crc),
-            .expected_mismatch  (1'b0)
+            .case_name         ("CRC_MATCH"),
+            .start_addr        (start_addr),
+            .end_addr          (end_addr),
+            .seed              (seed),
+            .exp_checksum      (golden_crc),
+            .golden_crc        (golden_crc),
+            .expected_mismatch (1'b0)
         );
 
 
         //========================================================
         //
-        // CASE 2 : CRC WRITE MISMATCH
+        // CASE 2
         //
-        // Deliberately write WRONG EXP_CHECKSUM.
+        // CRC WRITE MISMATCH
         //
-        // XOR bit0 guarantees:
+        // Deliberately write wrong expected CRC.
         //
-        // EXP != GOLDEN
+        // XOR 1 guarantees different checksum.
         //
         // Expected:
         //
-        // ACT_CHECKSUM    == GOLDEN
-        // CHKSUM_MISMATCH == 1
+        // ACT == GOLDEN
+        // EXP != ACT
+        // mismatch == 1
         //
         //========================================================
 
         run_crc_check_case(
-            .case_name          ("CRC_WRITE_MISMATCH"),
-            .start_addr         (start_addr),
-            .end_addr           (end_addr),
-            .seed               (seed),
-            .exp_checksum       (golden_crc ^ 16'h0001),
-            .golden_crc         (golden_crc),
-            .expected_mismatch  (1'b1)
+            .case_name         ("CRC_WRITE_MISMATCH"),
+            .start_addr        (start_addr),
+            .end_addr          (end_addr),
+            .seed              (seed),
+            .exp_checksum      (golden_crc ^ 16'h0001),
+            .golden_crc        (golden_crc),
+            .expected_mismatch (1'b1)
         );
 
 
         //========================================================
         //
-        // CASE 3 : MATCH AGAIN
+        // CASE 3
         //
-        // Verify previous mismatch flag does not stick.
+        // MATCH AGAIN
+        //
+        // Verify mismatch can clear after being asserted.
         //
         // Expected:
         //
-        // ACT_CHECKSUM    == GOLDEN
-        // CHKSUM_MISMATCH == 0
+        // ACT == GOLDEN
+        // mismatch == 0
         //
         //========================================================
 
         run_crc_check_case(
-            .case_name          ("CRC_MATCH_AFTER_MISMATCH"),
-            .start_addr         (start_addr),
-            .end_addr           (end_addr),
-            .seed               (seed),
-            .exp_checksum       (golden_crc),
-            .golden_crc         (golden_crc),
-            .expected_mismatch  (1'b0)
+            .case_name         ("CRC_MATCH_AFTER_MISMATCH"),
+            .start_addr        (start_addr),
+            .end_addr          (end_addr),
+            .seed              (seed),
+            .exp_checksum      (golden_crc),
+            .golden_crc        (golden_crc),
+            .expected_mismatch (1'b0)
         );
 
 
         `uvm_info(
             get_type_name(),
-            "==============================================",
-            UVM_LOW
-        )
-
-        `uvm_info(
-            get_type_name(),
-            "CRC TEST FINISHED",
-            UVM_LOW
-        )
-
-        `uvm_info(
-            get_type_name(),
-            "==============================================",
+            "\n================================================\nCRC TEST PASS FLOW FINISHED\n================================================",
             UVM_LOW
         )
 
@@ -291,10 +312,266 @@ class host_crc_ip_test extends host_base_test;
 
 
 
-    //============================================================
+    //======================================================================
+    //
+    // CRC SELF TEST
+    //
+    // Important:
+    //
+    // Do NOT trust golden model before checking it against known vectors.
+    //
+    // Tests:
+    //
+    // 1. "abc"
+    // 2. "123456789"
+    // 3. 32-bit endian test = 32'h12345678
+    //
+    //======================================================================
+
+    virtual task crc16_self_test();
+
+        logic [15:0] crc;
+        logic [15:0] expected_crc;
+
+
+        `uvm_info(
+            get_type_name(),
+            "\n================================================\nCRC16 SELF TEST START\n================================================",
+            UVM_LOW
+        )
+
+
+        //========================================================
+        //
+        // SELF TEST #1
+        //
+        // "abc"
+        //
+        // ASCII:
+        //
+        // a = 0x61
+        // b = 0x62
+        // c = 0x63
+        //
+        // Configuration:
+        //
+        // poly   = 0x8005
+        // init   = 0x0000
+        // refin  = false
+        // refout = false
+        // xorout = 0x0000
+        //
+        // Expected = 16'hCADB
+        //
+        //========================================================
+
+        crc =
+            16'h0000;
+
+
+        crc =
+            crc16_update_byte_msb(
+                crc,
+                8'h61
+            );
+
+
+        crc =
+            crc16_update_byte_msb(
+                crc,
+                8'h62
+            );
+
+
+        crc =
+            crc16_update_byte_msb(
+                crc,
+                8'h63
+            );
+
+
+        expected_crc =
+            16'hCADB;
+
+
+        if (
+            crc !== expected_crc
+        ) begin
+
+            `uvm_fatal(
+                get_type_name(),
+                $sformatf(
+                    {
+                        "\nCRC SELF TEST FAIL : abc",
+                        "\nExpected = 0x%04h",
+                        "\nActual   = 0x%04h"
+                    },
+                    expected_crc,
+                    crc
+                )
+            )
+
+        end
+        else begin
+
+            `uvm_info(
+                get_type_name(),
+                $sformatf(
+                    "CRC SELF TEST PASS : \"abc\" -> 0x%04h",
+                    crc
+                ),
+                UVM_LOW
+            )
+
+        end
+
+
+        //========================================================
+        //
+        // SELF TEST #2
+        //
+        // Standard check string:
+        //
+        // "123456789"
+        //
+        // Expected CRC = 16'hFEE8
+        //
+        //========================================================
+
+        crc =
+            16'h0000;
+
+
+        crc = crc16_update_byte_msb(crc, 8'h31);
+        crc = crc16_update_byte_msb(crc, 8'h32);
+        crc = crc16_update_byte_msb(crc, 8'h33);
+        crc = crc16_update_byte_msb(crc, 8'h34);
+        crc = crc16_update_byte_msb(crc, 8'h35);
+        crc = crc16_update_byte_msb(crc, 8'h36);
+        crc = crc16_update_byte_msb(crc, 8'h37);
+        crc = crc16_update_byte_msb(crc, 8'h38);
+        crc = crc16_update_byte_msb(crc, 8'h39);
+
+
+        expected_crc =
+            16'hFEE8;
+
+
+        if (
+            crc !== expected_crc
+        ) begin
+
+            `uvm_fatal(
+                get_type_name(),
+                $sformatf(
+                    {
+                        "\nCRC SELF TEST FAIL : 123456789",
+                        "\nExpected = 0x%04h",
+                        "\nActual   = 0x%04h"
+                    },
+                    expected_crc,
+                    crc
+                )
+            )
+
+        end
+        else begin
+
+            `uvm_info(
+                get_type_name(),
+                $sformatf(
+                    "CRC SELF TEST PASS : \"123456789\" -> 0x%04h",
+                    crc
+                ),
+                UVM_LOW
+            )
+
+        end
+
+
+        //========================================================
+        //
+        // SELF TEST #3
+        //
+        // Verify the 32-bit WORD function byte ordering.
+        //
+        // data = 32'h12345678
+        //
+        // RTL processing order:
+        //
+        // 78
+        // 56
+        // 34
+        // 12
+        //
+        // Expected = 16'h5C43
+        //
+        //========================================================
+
+        crc =
+            crc16_update_word(
+                16'h0000,
+                32'h1234_5678
+            );
+
+
+        expected_crc =
+            16'h5C43;
+
+
+        if (
+            crc !== expected_crc
+        ) begin
+
+            `uvm_fatal(
+                get_type_name(),
+                $sformatf(
+                    {
+                        "\nCRC WORD SELF TEST FAIL",
+                        "\nDATA     = 0x12345678",
+                        "\nExpected = 0x%04h",
+                        "\nActual   = 0x%04h",
+                        "\nExpected byte order = 78 -> 56 -> 34 -> 12"
+                    },
+                    expected_crc,
+                    crc
+                )
+            )
+
+        end
+        else begin
+
+            `uvm_info(
+                get_type_name(),
+                $sformatf(
+                    {
+                        "CRC WORD SELF TEST PASS : ",
+                        "0x12345678 -> 0x%04h ",
+                        "(byte order 78->56->34->12)"
+                    },
+                    crc
+                ),
+                UVM_LOW
+            )
+
+        end
+
+
+        `uvm_info(
+            get_type_name(),
+            "\n================================================\nCRC16 SELF TEST ALL PASS\n================================================",
+            UVM_LOW
+        )
+
+    endtask
+
+
+
+    //======================================================================
+    //
     // Generate valid CRC range
     //
-    // DUT address sequence:
+    // DUT address:
     //
     // START
     // START + 4
@@ -302,8 +579,7 @@ class host_crc_ip_test extends host_base_test;
     // ...
     // END
     //
-    // START and END must therefore be 4-byte aligned.
-    //============================================================
+    //======================================================================
 
     virtual task gen_crc_range(
         output logic [31:0] start_addr,
@@ -321,14 +597,10 @@ class host_crc_ip_test extends host_base_test;
         int unsigned start_word_offset;
 
 
-        //--------------------------------------------------------
-        // Select valid region.
-        //
-        // You can adjust the list according to which regions
-        // CRC hardware is actually allowed to access.
-        //========================================================
+        case (
+            $urandom_range(0, 2)
+        )
 
-        case ($urandom_range(0, 2))
 
             0: begin
 
@@ -366,7 +638,7 @@ class host_crc_ip_test extends host_base_test;
 
 
         //--------------------------------------------------------
-        // Align start upward.
+        // Align upward.
         //--------------------------------------------------------
 
         aligned_start =
@@ -375,7 +647,7 @@ class host_crc_ip_test extends host_base_test;
 
 
         //--------------------------------------------------------
-        // Align end downward.
+        // Align downward.
         //--------------------------------------------------------
 
         aligned_end =
@@ -383,12 +655,14 @@ class host_crc_ip_test extends host_base_test;
             & 32'hFFFF_FFFC;
 
 
-        if (aligned_end < aligned_start) begin
+        if (
+            aligned_end < aligned_start
+        ) begin
 
             `uvm_fatal(
                 get_type_name(),
                 $sformatf(
-                    "Invalid CRC region : START=0x%08h END=0x%08h",
+                    "Invalid CRC address region START=%08h END=%08h",
                     region_start,
                     region_end
                 )
@@ -397,19 +671,14 @@ class host_crc_ip_test extends host_base_test;
         end
 
 
-        //--------------------------------------------------------
-        // Number of available 32-bit words.
-        //--------------------------------------------------------
-
         available_words =
-            ((aligned_end - aligned_start) >> 2) + 1;
+            ((aligned_end - aligned_start) >> 2)
+            + 1;
 
 
-        //--------------------------------------------------------
-        // Avoid an excessively long testcase.
-        //--------------------------------------------------------
-
-        if (available_words > 64) begin
+        if (
+            available_words > 64
+        ) begin
 
             word_num =
                 $urandom_range(
@@ -429,10 +698,6 @@ class host_crc_ip_test extends host_base_test;
         end
 
 
-        //--------------------------------------------------------
-        // Choose start offset.
-        //--------------------------------------------------------
-
         start_word_offset =
             $urandom_range(
                 0,
@@ -440,18 +705,10 @@ class host_crc_ip_test extends host_base_test;
             );
 
 
-        //--------------------------------------------------------
-        // START address.
-        //--------------------------------------------------------
-
         start_addr =
             aligned_start
             + (start_word_offset * 4);
 
-
-        //--------------------------------------------------------
-        // END means address of LAST word.
-        //--------------------------------------------------------
 
         end_addr =
             start_addr
@@ -463,46 +720,24 @@ class host_crc_ip_test extends host_base_test;
         //--------------------------------------------------------
 
         if (
-            start_addr[1:0] != 2'b00
+            start_addr[1:0] !== 2'b00
         ) begin
 
             `uvm_fatal(
                 get_type_name(),
-                $sformatf(
-                    "START_ADDR is not aligned : 0x%08h",
-                    start_addr
-                )
+                "START_ADDR is not 4-byte aligned"
             )
 
         end
 
 
         if (
-            end_addr[1:0] != 2'b00
+            end_addr[1:0] !== 2'b00
         ) begin
 
             `uvm_fatal(
                 get_type_name(),
-                $sformatf(
-                    "END_ADDR is not aligned : 0x%08h",
-                    end_addr
-                )
-            )
-
-        end
-
-
-        if (
-            end_addr > aligned_end
-        ) begin
-
-            `uvm_fatal(
-                get_type_name(),
-                $sformatf(
-                    "END_ADDR exceeds valid region : 0x%08h > 0x%08h",
-                    end_addr,
-                    aligned_end
-                )
+                "END_ADDR is not 4-byte aligned"
             )
 
         end
@@ -511,27 +746,18 @@ class host_crc_ip_test extends host_base_test;
 
 
 
-    //============================================================
-    // Memory byte write wrapper
+    //======================================================================
     //
-    // IMPORTANT:
+    // Memory WRITE wrapper
     //
-    // If your mcu_wr() prototype is different,
-    // modify ONLY this task.
-    //============================================================
+    // Change this task only if your mcu_wr() prototype differs.
+    //
+    //======================================================================
 
     virtual task crc_mem_wr_byte(
         input logic [31:0] addr,
         input logic [7:0] data
     );
-
-        //--------------------------------------------------------
-        // Based on the address format visible in your original
-        // testcase:
-        //
-        // {addr[23:0], 8'h00}
-        //
-        //========================================================
 
         mcu_wr(
             {addr[23:0], 8'h00},
@@ -542,16 +768,15 @@ class host_crc_ip_test extends host_base_test;
 
 
 
-    //============================================================
-    // Memory byte read wrapper
+    //======================================================================
     //
-    // If your mcu_rd() prototype is different,
-    // modify ONLY this task.
-    //============================================================
+    // Memory READ wrapper
+    //
+    //======================================================================
 
     virtual task crc_mem_rd_byte(
         input  logic [31:0] addr,
-        output logic [7:0]  data
+        output logic [7:0] data
     );
 
         mcu_rd(
@@ -563,16 +788,18 @@ class host_crc_ip_test extends host_base_test;
 
 
 
-    //============================================================
-    // Prepare CRC memory
+    //======================================================================
     //
-    // One CRC word:
+    // Prepare Memory
     //
-    // addr+0 = word[7:0]
-    // addr+1 = word[15:8]
-    // addr+2 = word[23:16]
-    // addr+3 = word[31:24]
-    //============================================================
+    // Each CRC word:
+    //
+    // addr+0 : word[7:0]
+    // addr+1 : word[15:8]
+    // addr+2 : word[23:16]
+    // addr+3 : word[31:24]
+    //
+    //======================================================================
 
     virtual task prepare_crc_memory(
         input logic [31:0] start_addr,
@@ -593,9 +820,6 @@ class host_crc_ip_test extends host_base_test;
             i++
         ) begin
 
-            //----------------------------------------------------
-            // Current 32-bit word address.
-            //----------------------------------------------------
 
             addr =
                 start_addr
@@ -603,7 +827,7 @@ class host_crc_ip_test extends host_base_test;
 
 
             //----------------------------------------------------
-            // Generate random known value.
+            // Generate known data.
             //----------------------------------------------------
 
             word_data =
@@ -615,29 +839,29 @@ class host_crc_ip_test extends host_base_test;
 
 
             //----------------------------------------------------
-            // Write data byte-by-byte.
+            // WRITE SAME ADDRESS RANGE
             //----------------------------------------------------
 
             crc_mem_wr_byte(
-                addr + 32'd0,
+                addr + 0,
                 word_data[7:0]
             );
 
 
             crc_mem_wr_byte(
-                addr + 32'd1,
+                addr + 1,
                 word_data[15:8]
             );
 
 
             crc_mem_wr_byte(
-                addr + 32'd2,
+                addr + 2,
                 word_data[23:16]
             );
 
 
             crc_mem_wr_byte(
-                addr + 32'd3,
+                addr + 3,
                 word_data[31:24]
             );
 
@@ -645,7 +869,7 @@ class host_crc_ip_test extends host_base_test;
             `uvm_info(
                 get_type_name(),
                 $sformatf(
-                    "CRC MEM WRITE : ADDR=0x%08h DATA=0x%08h",
+                    "CRC MEM WRITE : ADDR=%08h DATA=%08h",
                     addr,
                     word_data
                 ),
@@ -658,24 +882,16 @@ class host_crc_ip_test extends host_base_test;
 
 
 
-    //============================================================
-    // Read SAME addresses and calculate golden CRC
+    //======================================================================
     //
-    // Flow:
+    // READBACK SAME ADDRESS AND CALCULATE GOLDEN
     //
-    // WRITE
-    //   ↓
-    // READBACK
-    //   ↓
-    // compare expected memory
-    //   ↓
-    // calculate golden CRC
-    //============================================================
+    //======================================================================
 
     virtual task readback_crc_memory_and_calc_golden(
-        input  logic [31:0] start_addr,
-        input  int unsigned word_num,
-        input  logic [15:0] seed,
+        input logic [31:0] start_addr,
+        input int unsigned word_num,
+        input logic [15:0] seed,
         output logic [15:0] golden_crc
     );
 
@@ -694,22 +910,8 @@ class host_crc_ip_test extends host_base_test;
             new[word_num];
 
 
-        //--------------------------------------------------------
-        // CRC initial value = SEED
-        //--------------------------------------------------------
-
         crc =
             seed;
-
-
-        `uvm_info(
-            get_type_name(),
-            $sformatf(
-                "CRC GOLDEN START : SEED=0x%04h",
-                seed
-            ),
-            UVM_LOW
-        )
 
 
         for (
@@ -718,46 +920,42 @@ class host_crc_ip_test extends host_base_test;
             i++
         ) begin
 
+
             addr =
                 start_addr
                 + (i * 4);
 
 
             //----------------------------------------------------
-            // Read exactly the same four byte addresses.
+            // READ SAME ADDRESS
             //----------------------------------------------------
 
             crc_mem_rd_byte(
-                addr + 32'd0,
+                addr + 0,
                 byte0
             );
 
 
             crc_mem_rd_byte(
-                addr + 32'd1,
+                addr + 1,
                 byte1
             );
 
 
             crc_mem_rd_byte(
-                addr + 32'd2,
+                addr + 2,
                 byte2
             );
 
 
             crc_mem_rd_byte(
-                addr + 32'd3,
+                addr + 3,
                 byte3
             );
 
 
             //----------------------------------------------------
             // Rebuild 32-bit word.
-            //
-            // addr+0 -> [7:0]
-            // addr+1 -> [15:8]
-            // addr+2 -> [23:16]
-            // addr+3 -> [31:24]
             //----------------------------------------------------
 
             word_data = {
@@ -773,7 +971,7 @@ class host_crc_ip_test extends host_base_test;
 
 
             //----------------------------------------------------
-            // Memory check.
+            // First verify memory itself.
             //----------------------------------------------------
 
             if (
@@ -784,10 +982,10 @@ class host_crc_ip_test extends host_base_test;
                     get_type_name(),
                     $sformatf(
                         {
-                            "CRC MEMORY READBACK FAIL : ",
-                            "ADDR=0x%08h ",
-                            "EXPECTED=0x%08h ",
-                            "READ=0x%08h"
+                            "CRC MEMORY ERROR : ",
+                            "ADDR=%08h ",
+                            "WRITE=%08h ",
+                            "READ=%08h"
                         },
                         addr,
                         crc_mem_expected[i],
@@ -799,17 +997,17 @@ class host_crc_ip_test extends host_base_test;
 
 
             //----------------------------------------------------
-            // Calculate golden CRC.
+            // Then calculate golden CRC.
             //----------------------------------------------------
 
             `uvm_info(
                 get_type_name(),
                 $sformatf(
                     {
-                        "CRC GOLDEN WORD : ",
-                        "ADDR=0x%08h ",
-                        "DATA=0x%08h ",
-                        "CRC_BEFORE=0x%04h"
+                        "CRC GOLDEN : ",
+                        "ADDR=%08h ",
+                        "DATA=%08h ",
+                        "CRC_BEFORE=%04h"
                     },
                     addr,
                     word_data,
@@ -829,7 +1027,7 @@ class host_crc_ip_test extends host_base_test;
             `uvm_info(
                 get_type_name(),
                 $sformatf(
-                    "CRC_AFTER = 0x%04h",
+                    "CRC_AFTER=%04h",
                     crc
                 ),
                 UVM_HIGH
@@ -845,7 +1043,7 @@ class host_crc_ip_test extends host_base_test;
         `uvm_info(
             get_type_name(),
             $sformatf(
-                "CRC GOLDEN FINAL = 0x%04h",
+                "FINAL GOLDEN CRC = 0x%04h",
                 golden_crc
             ),
             UVM_LOW
@@ -855,22 +1053,17 @@ class host_crc_ip_test extends host_base_test;
 
 
 
-    //============================================================
-    // CRC16 BYTE UPDATE
+    //======================================================================
     //
-    // Polynomial:
+    // CRC16 BYTE
     //
-    // x^16 + x^15 + x^2 + 1
+    // Polynomial = 16'h8005
     //
-    // POLY = 16'h8005
+    // MSB FIRST
     //
-    // RTL processing order:
+    // bit7 -> bit0
     //
-    // data[7]
-    // data[6]
-    // ...
-    // data[0]
-    //============================================================
+    //======================================================================
 
     virtual function automatic logic [15:0]
     crc16_update_byte_msb(
@@ -879,7 +1072,7 @@ class host_crc_ip_test extends host_base_test;
     );
 
         logic [15:0] crc;
-        logic        feedback;
+        logic feedback;
 
 
         crc =
@@ -892,34 +1085,22 @@ class host_crc_ip_test extends host_base_test;
             i--
         ) begin
 
-            //----------------------------------------------------
-            // feedback = CRC MSB XOR input bit.
-            //----------------------------------------------------
 
             feedback =
                 crc[15]
                 ^ data_i[i];
 
 
-            //----------------------------------------------------
-            // Shift left.
-            //----------------------------------------------------
-
             crc =
                 {crc[14:0], 1'b0};
 
-
-            //----------------------------------------------------
-            // Apply polynomial.
-            //----------------------------------------------------
 
             if (
                 feedback
             ) begin
 
-                crc =
-                    crc
-                    ^ 16'h8005;
+                crc ^=
+                    16'h8005;
 
             end
 
@@ -932,16 +1113,18 @@ class host_crc_ip_test extends host_base_test;
 
 
 
-    //============================================================
-    // CRC16 WORD UPDATE
+    //======================================================================
     //
-    // RTL byte order:
+    // CRC16 32-BIT WORD
     //
-    // FIRST  : data[7:0]
-    // SECOND : data[15:8]
-    // THIRD  : data[23:16]
-    // FOURTH : data[31:24]
-    //============================================================
+    // RTL order:
+    //
+    // [7:0]
+    // [15:8]
+    // [23:16]
+    // [31:24]
+    //
+    //======================================================================
 
     virtual function automatic logic [15:0]
     crc16_update_word(
@@ -956,20 +1139,12 @@ class host_crc_ip_test extends host_base_test;
             crc_i;
 
 
-        //--------------------------------------------------------
-        // BYTE 0
-        //--------------------------------------------------------
-
         crc =
             crc16_update_byte_msb(
                 crc,
                 data_i[7:0]
             );
 
-
-        //--------------------------------------------------------
-        // BYTE 1
-        //--------------------------------------------------------
 
         crc =
             crc16_update_byte_msb(
@@ -978,20 +1153,12 @@ class host_crc_ip_test extends host_base_test;
             );
 
 
-        //--------------------------------------------------------
-        // BYTE 2
-        //--------------------------------------------------------
-
         crc =
             crc16_update_byte_msb(
                 crc,
                 data_i[23:16]
             );
 
-
-        //--------------------------------------------------------
-        // BYTE 3
-        //--------------------------------------------------------
 
         crc =
             crc16_update_byte_msb(
@@ -1006,9 +1173,11 @@ class host_crc_ip_test extends host_base_test;
 
 
 
-    //============================================================
-    // Program CRC registers
-    //============================================================
+    //======================================================================
+    //
+    // CRC register configuration
+    //
+    //======================================================================
 
     virtual task set_crc_config(
         input logic [31:0] start_addr,
@@ -1016,6 +1185,7 @@ class host_crc_ip_test extends host_base_test;
         input logic [15:0] exp_checksum,
         input logic [15:0] seed
     );
+
 
         //--------------------------------------------------------
         // SEED
@@ -1122,10 +1292,10 @@ class host_crc_ip_test extends host_base_test;
             $sformatf(
                 {
                     "CRC CONFIG : ",
-                    "START=0x%08h ",
-                    "END=0x%08h ",
-                    "SEED=0x%04h ",
-                    "EXP=0x%04h"
+                    "START=%08h ",
+                    "END=%08h ",
+                    "SEED=%04h ",
+                    "EXP=%04h"
                 },
                 start_addr,
                 end_addr,
@@ -1139,9 +1309,11 @@ class host_crc_ip_test extends host_base_test;
 
 
 
-    //============================================================
-    // Enable checksum complete
-    //============================================================
+    //======================================================================
+    //
+    // Enable COMPLETE
+    //
+    //======================================================================
 
     virtual task enable_chksum_complete_en();
 
@@ -1169,7 +1341,7 @@ class host_crc_ip_test extends host_base_test;
             `uvm_error(
                 get_type_name(),
                 $sformatf(
-                    "CHKSUM_COMPLETE_EN write fail : READ=0x%02h",
+                    "CHKSUM_COMPLETE_EN FAIL READ=%02h",
                     rdata
                 )
             )
@@ -1180,11 +1352,11 @@ class host_crc_ip_test extends host_base_test;
 
 
 
-    //============================================================
-    // CHECK_START
+    //======================================================================
     //
-    // 0x00[0] W1S
-    //============================================================
+    // CHECK START
+    //
+    //======================================================================
 
     virtual task set_check_start();
 
@@ -1198,22 +1370,23 @@ class host_crc_ip_test extends host_base_test;
 
 
 
-    //============================================================
-    // Poll checksum complete
+    //======================================================================
     //
-    // 0x14[0]
-    //============================================================
+    // Poll COMPLETE
+    //
+    //======================================================================
 
     virtual task poll_chksum_complete(
         input int unsigned max_retry = 10000
     );
 
         logic [7:0] rdata;
-        bit         detected;
+
+        bit detected;
 
 
         detected =
-            1'b0;
+            0;
 
 
         for (
@@ -1221,6 +1394,7 @@ class host_crc_ip_test extends host_base_test;
             i < max_retry;
             i++
         ) begin
+
 
             mcu_reg_rd(
                 crc_page_addr,
@@ -1234,13 +1408,13 @@ class host_crc_ip_test extends host_base_test;
             ) begin
 
                 detected =
-                    1'b1;
+                    1;
 
 
                 `uvm_info(
                     get_type_name(),
                     $sformatf(
-                        "CHKSUM_COMPLETE detected after %0d polls",
+                        "CHKSUM_COMPLETE after %0d polls",
                         i + 1
                     ),
                     UVM_LOW
@@ -1260,17 +1434,14 @@ class host_crc_ip_test extends host_base_test;
 
             `uvm_fatal(
                 get_type_name(),
-                $sformatf(
-                    "CRC timeout : CHKSUM_COMPLETE never asserted, max_retry=%0d",
-                    max_retry
-                )
+                "CRC COMPLETE TIMEOUT"
             )
 
         end
 
 
         //--------------------------------------------------------
-        // Verify CHECK_START has self-cleared.
+        // CHECK_START should self clear.
         //--------------------------------------------------------
 
         mcu_reg_rd(
@@ -1286,10 +1457,7 @@ class host_crc_ip_test extends host_base_test;
 
             `uvm_error(
                 get_type_name(),
-                $sformatf(
-                    "CHECK_START did not self-clear : CTRL=0x%02h",
-                    rdata
-                )
+                "CHECK_START DID NOT SELF CLEAR"
             )
 
         end
@@ -1298,9 +1466,11 @@ class host_crc_ip_test extends host_base_test;
 
 
 
-    //============================================================
-    // Read actual checksum
-    //============================================================
+    //======================================================================
+    //
+    // Get ACT checksum
+    //
+    //======================================================================
 
     virtual task get_act_checksum(
         output logic [15:0] act_checksum
@@ -1329,25 +1499,15 @@ class host_crc_ip_test extends host_base_test;
             lo
         };
 
-
-        `uvm_info(
-            get_type_name(),
-            $sformatf(
-                "ACT_CHECKSUM = 0x%04h",
-                act_checksum
-            ),
-            UVM_LOW
-        )
-
     endtask
 
 
 
-    //============================================================
-    // Read checksum mismatch
+    //======================================================================
     //
-    // 0x00[1]
-    //============================================================
+    // Get mismatch flag
+    //
+    //======================================================================
 
     virtual task get_chksum_mismatch(
         output logic mismatch
@@ -1366,25 +1526,15 @@ class host_crc_ip_test extends host_base_test;
         mismatch =
             rdata[1];
 
-
-        `uvm_info(
-            get_type_name(),
-            $sformatf(
-                "CHKSUM_MISMATCH = %0b",
-                mismatch
-            ),
-            UVM_LOW
-        )
-
     endtask
 
 
 
-    //============================================================
-    // Clear checksum complete
+    //======================================================================
     //
-    // 0x14[0] W1C
-    //============================================================
+    // Clear COMPLETE
+    //
+    //======================================================================
 
     virtual task clear_chksum_complete();
 
@@ -1392,7 +1542,7 @@ class host_crc_ip_test extends host_base_test;
 
 
         //--------------------------------------------------------
-        // Write 1 to clear.
+        // W1C
         //--------------------------------------------------------
 
         mcu_reg_wr(
@@ -1403,7 +1553,7 @@ class host_crc_ip_test extends host_base_test;
 
 
         //--------------------------------------------------------
-        // Read back and verify clear.
+        // Verify clear
         //--------------------------------------------------------
 
         mcu_reg_rd(
@@ -1419,19 +1569,7 @@ class host_crc_ip_test extends host_base_test;
 
             `uvm_error(
                 get_type_name(),
-                $sformatf(
-                    "CHKSUM_COMPLETE clear fail : READ=0x%02h",
-                    rdata
-                )
-            )
-
-        end
-        else begin
-
-            `uvm_info(
-                get_type_name(),
-                "CHKSUM_COMPLETE clear PASS",
-                UVM_LOW
+                "CHKSUM_COMPLETE W1C FAIL"
             )
 
         end
@@ -1440,26 +1578,25 @@ class host_crc_ip_test extends host_base_test;
 
 
 
-    //============================================================
-    // Run one CRC verification case
+    //======================================================================
     //
-    // This task verifies TWO independent things:
+    // RUN ONE CRC CASE
     //
-    // 1. GOLDEN vs ACT
-    //    -> CRC calculation
-    //
-    // 2. EXP vs ACT and mismatch flag
-    //    -> checksum comparison logic
-    //============================================================
+    //======================================================================
 
     virtual task run_crc_check_case(
+
         input string       case_name,
+
         input logic [31:0] start_addr,
         input logic [31:0] end_addr,
+
         input logic [15:0] seed,
+
         input logic [15:0] exp_checksum,
         input logic [15:0] golden_crc,
-        input logic        expected_mismatch
+
+        input logic expected_mismatch
     );
 
         logic [15:0] act_checksum;
@@ -1467,21 +1604,22 @@ class host_crc_ip_test extends host_base_test;
         logic actual_mismatch;
         logic derived_mismatch;
 
+        logic [7:0] complete_status;
+
 
         `uvm_info(
             get_type_name(),
             $sformatf(
                 {
-                    "\n==============================================",
+                    "\n================================================",
                     "\nCRC CASE : %s",
-                    "\n----------------------------------------------",
-                    "\nSTART              = 0x%08h",
-                    "\nEND                = 0x%08h",
-                    "\nSEED               = 0x%04h",
-                    "\nGOLDEN             = 0x%04h",
-                    "\nEXP_CHECKSUM       = 0x%04h",
-                    "\nEXPECTED_MISMATCH  = %0b",
-                    "\n=============================================="
+                    "\nSTART            = %08h",
+                    "\nEND              = %08h",
+                    "\nSEED             = %04h",
+                    "\nGOLDEN           = %04h",
+                    "\nEXP              = %04h",
+                    "\nEXPECTED MISMATCH= %0b",
+                    "\n================================================"
                 },
                 case_name,
                 start_addr,
@@ -1495,34 +1633,28 @@ class host_crc_ip_test extends host_base_test;
         )
 
 
-        //--------------------------------------------------------
-        // Clear stale COMPLETE before starting new case.
-        //--------------------------------------------------------
+        //========================================================
+        // Clear stale COMPLETE
+        //========================================================
 
-        begin
-
-            logic [7:0] complete_data;
-
-            mcu_reg_rd(
-                crc_page_addr,
-                CRC_REG_CHKSUM_COMPLETE,
-                complete_data
-            );
+        mcu_reg_rd(
+            crc_page_addr,
+            CRC_REG_CHKSUM_COMPLETE,
+            complete_status
+        );
 
 
-            if (
-                complete_data[0] === 1'b1
-            ) begin
+        if (
+            complete_status[0] === 1'b1
+        ) begin
 
-                clear_chksum_complete();
-
-            end
+            clear_chksum_complete();
 
         end
 
 
         //========================================================
-        // Program config
+        // Program registers
         //========================================================
 
         set_crc_config(
@@ -1534,17 +1666,14 @@ class host_crc_ip_test extends host_base_test;
 
 
         //========================================================
-        // Enable completion
+        // Enable complete
         //========================================================
 
         enable_chksum_complete_en();
 
 
         //========================================================
-        // Start CRC
-        //
-        // RTL/spec should clear old mismatch condition when
-        // CHECK_START is accepted.
+        // Start
         //========================================================
 
         set_check_start();
@@ -1554,13 +1683,11 @@ class host_crc_ip_test extends host_base_test;
         // Wait complete
         //========================================================
 
-        poll_chksum_complete(
-            10000
-        );
+        poll_chksum_complete();
 
 
         //========================================================
-        // Read ACT checksum
+        // Read ACT
         //========================================================
 
         get_act_checksum(
@@ -1569,11 +1696,11 @@ class host_crc_ip_test extends host_base_test;
 
 
         //========================================================
-        // CHECK #1
         //
-        // Golden vs ACT
+        // CHECK 1
         //
-        // This MUST pass in both MATCH and MISMATCH cases.
+        // Golden CRC vs ACT checksum
+        //
         //========================================================
 
         if (
@@ -1584,18 +1711,12 @@ class host_crc_ip_test extends host_base_test;
                 get_type_name(),
                 $sformatf(
                     {
-                        "\n==============================================",
-                        "\n[%s] CRC CALCULATION FAIL",
-                        "\n----------------------------------------------",
-                        "\nGOLDEN CRC    = 0x%04h",
-                        "\nACT CHECKSUM  = 0x%04h",
-                        "\nEXP CHECKSUM  = 0x%04h",
-                        "\n=============================================="
+                        "[%s] CRC CALC FAIL : ",
+                        "GOLDEN=%04h ACT=%04h"
                     },
                     case_name,
                     golden_crc,
-                    act_checksum,
-                    exp_checksum
+                    act_checksum
                 )
             )
 
@@ -1605,7 +1726,7 @@ class host_crc_ip_test extends host_base_test;
             `uvm_info(
                 get_type_name(),
                 $sformatf(
-                    "[%s] CRC CALC PASS : GOLDEN=0x%04h ACT=0x%04h",
+                    "[%s] CRC CALC PASS : GOLDEN=%04h ACT=%04h",
                     case_name,
                     golden_crc,
                     act_checksum
@@ -1617,7 +1738,11 @@ class host_crc_ip_test extends host_base_test;
 
 
         //========================================================
-        // Read mismatch flag
+        //
+        // CHECK 2
+        //
+        // Read DUT mismatch.
+        //
         //========================================================
 
         get_chksum_mismatch(
@@ -1626,7 +1751,9 @@ class host_crc_ip_test extends host_base_test;
 
 
         //========================================================
-        // Independently derive mismatch from actual HW values.
+        //
+        // Derive independently.
+        //
         //========================================================
 
         derived_mismatch =
@@ -1634,9 +1761,9 @@ class host_crc_ip_test extends host_base_test;
 
 
         //========================================================
-        // CHECK #2
         //
-        // Expected testcase behavior.
+        // Verify flag against testcase expectation.
+        //
         //========================================================
 
         if (
@@ -1647,20 +1774,13 @@ class host_crc_ip_test extends host_base_test;
                 get_type_name(),
                 $sformatf(
                     {
-                        "\n==============================================",
-                        "\n[%s] CHKSUM_MISMATCH FAIL",
-                        "\n----------------------------------------------",
-                        "\nGOLDEN             = 0x%04h",
-                        "\nACT_CHECKSUM       = 0x%04h",
-                        "\nEXP_CHECKSUM       = 0x%04h",
-                        "\nEXPECTED_MISMATCH  = %0b",
-                        "\nACTUAL_MISMATCH    = %0b",
-                        "\n=============================================="
+                        "[%s] MISMATCH FLAG FAIL : ",
+                        "EXP=%04h ACT=%04h ",
+                        "EXPECT_FLAG=%0b ACTUAL_FLAG=%0b"
                     },
                     case_name,
-                    golden_crc,
-                    act_checksum,
                     exp_checksum,
+                    act_checksum,
                     expected_mismatch,
                     actual_mismatch
                 )
@@ -1672,7 +1792,7 @@ class host_crc_ip_test extends host_base_test;
             `uvm_info(
                 get_type_name(),
                 $sformatf(
-                    "[%s] CHKSUM_MISMATCH PASS : FLAG=%0b",
+                    "[%s] MISMATCH FLAG PASS : FLAG=%0b",
                     case_name,
                     actual_mismatch
                 ),
@@ -1683,12 +1803,9 @@ class host_crc_ip_test extends host_base_test;
 
 
         //========================================================
-        // CHECK #3
         //
-        // Verify RTL mismatch flag really matches ACT != EXP.
+        // Verify flag against actual EXP != ACT.
         //
-        // This avoids the testcase passing just because
-        // expected_mismatch was manually specified incorrectly.
         //========================================================
 
         if (
@@ -1699,11 +1816,8 @@ class host_crc_ip_test extends host_base_test;
                 get_type_name(),
                 $sformatf(
                     {
-                        "[%s] MISMATCH LOGIC FAIL : ",
-                        "ACT=0x%04h ",
-                        "EXP=0x%04h ",
-                        "DERIVED=%0b ",
-                        "FLAG=%0b"
+                        "[%s] MISMATCH COMPARE LOGIC FAIL : ",
+                        "ACT=%04h EXP=%04h DERIVED=%0b FLAG=%0b"
                     },
                     case_name,
                     act_checksum,
@@ -1717,17 +1831,15 @@ class host_crc_ip_test extends host_base_test;
 
 
         //========================================================
-        // Explicit mismatch case check.
         //
-        // For CRC_WRITE_MISMATCH:
+        // Explicit mismatch assertion check
         //
-        // ACT must still equal GOLDEN,
-        // while EXP must differ.
         //========================================================
 
         if (
-            expected_mismatch == 1'b1
+            expected_mismatch
         ) begin
+
 
             if (
                 exp_checksum === golden_crc
@@ -1735,10 +1847,7 @@ class host_crc_ip_test extends host_base_test;
 
                 `uvm_fatal(
                     get_type_name(),
-                    $sformatf(
-                        "[%s] Testbench bug : EXP_CHECKSUM accidentally equals GOLDEN",
-                        case_name
-                    )
+                    "TESTBENCH ERROR : mismatch case EXP equals GOLDEN"
                 )
 
             end
@@ -1750,10 +1859,7 @@ class host_crc_ip_test extends host_base_test;
 
                 `uvm_error(
                     get_type_name(),
-                    $sformatf(
-                        "[%s] CRC mismatch flag was NOT asserted",
-                        case_name
-                    )
+                    "CRC WRITE MISMATCH FLAG DID NOT ASSERT"
                 )
 
             end
@@ -1761,10 +1867,7 @@ class host_crc_ip_test extends host_base_test;
 
                 `uvm_info(
                     get_type_name(),
-                    $sformatf(
-                        "[%s] CRC mismatch flag successfully asserted",
-                        case_name
-                    ),
+                    "CRC WRITE MISMATCH FLAG ASSERT PASS",
                     UVM_LOW
                 )
 
@@ -1774,7 +1877,7 @@ class host_crc_ip_test extends host_base_test;
 
 
         //========================================================
-        // Clear COMPLETE for next case.
+        // Clear COMPLETE
         //========================================================
 
         clear_chksum_complete();
@@ -1793,5 +1896,6 @@ class host_crc_ip_test extends host_base_test;
 
 
 endclass
+
 
 `endif
