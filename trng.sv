@@ -1,29 +1,64 @@
 // ============================================================================
 // mcu_trng_test.sv
 //
-// TRNG Manual Mode / Health Test / Conditioning / Error Flag Verification
+// TRNG Manual Mode Verification
 //
-// 驗證項目：
+// 依照目前確認過的 RTL / Register 行為：
 //
-// 1. 驗證 TRNG manual mode 正常運作
-// 2. 驗證 Health Test 正常資料不會產生 error
-// 3. 驗證 Startup Repetition-One Error Flag
-// 4. 驗證 Startup Repetition-Zero Error Flag
-// 5. 驗證 Startup Adaptive Error Flag
-// 6. 驗證 Runtime Repetition-One Error Flag
-// 7. 驗證 Runtime Repetition-Zero Error Flag
-// 8. 驗證 Runtime Adaptive Error Flag
-// 9. 驗證 Conditioning Component
-// 10. 驗證各種 error flag 可以 clear
-// 11. 驗證 error 發生後可以 recovery
+//   1. FIGA enable
+//      assign figa_enable = reg_04_ctrl[7];
 //
-// 設計原則：
+//   2. Health debug input
+//      health_debug_mode 0 -> 1
+//              |
+//              v
+//      debug_trng_data <= SW_TRNG_DATA
 //
-// - 優先透過 software-visible register 驗證
-// - manual mode 使用 trng_req_sw
-// - 不直接依賴 internal RTL signal 判 PASS/FAIL
-// - 所有 wait 都有 timeout
-// - 每個 error case 都做 Clear -> Inject -> Trigger -> Check -> Clear
+//      health debug mode 維持 1 時：
+//      debug_trng_data 每個 clock rotate 8-bit。
+//      Health-test 實際吃 debug_trng_data[7:0]。
+//
+//   3. Conditioning input
+//
+//      trng_data_select =
+//          conditioning_random_number_debug_mode ?
+//              SW_TRNG_DATA :
+//              trng_data[511:0];
+//
+//      所以 conditioning debug 不需要 0->1 capture pulse。
+//
+//   4. Startup FSM
+//
+//      IDLE
+//        |
+//        | figa_enable == 1
+//        | bypass_start_test == 0
+//        | start_test_counter == start_test_threshold
+//        v
+//      START_TEST
+//        |
+//        | adaptation_test_block_counter == 127
+//        | no startup error
+//        v
+//      HEALTH_TEST
+//
+//   5. bypass_start_test == 1
+//
+//      IDLE -> HEALTH_TEST
+//
+//   6. conditioning_valid
+//
+//      trng_req_sw
+//      && trng_cs == TRNG_HEALTH_TEST
+//      && !health_test_fail
+//      && !trng_debug_mode
+//
+//   7. conditioning_finish
+//
+//      conditioning_done
+//      && trng_cs == TRNG_HEALTH_TEST
+//      && !health_test_fail
+//      && !trng_debug_mode
 //
 // ============================================================================
 
@@ -33,337 +68,113 @@ class mcu_trng_test extends host_base_test;
 
 
     // ========================================================================
-    // TRNG REGISTER WORD INDEX
+    // Register word address
     //
-    // 你的 access format：
-    //
-    // { trng_page_addr, word_index[5:0], 2'b00 }
-    //
-    // 所以：
-    //
-    // word 6'h09 -> byte offset 0x24
-    // word 6'h15 -> byte offset 0x54
-    //
+    // byte offset = word_addr << 2
     // ========================================================================
 
+    localparam bit [5:0] TRNG_FIGA_CTRL            = 6'h04; // 0x10
+    localparam bit [5:0] TRNG_CTRL                 = 6'h05; // 0x14
+    localparam bit [5:0] TRNG_FIGA_OUT_SEL         = 6'h06; // 0x18
+    localparam bit [5:0] TRNG_SW_FIGA_ENABLE_MODE  = 6'h07; // 0x1C
+    localparam bit [5:0] TRNG_SW_FIGA_LOCAL_ENABLE = 6'h08; // 0x20
 
-    // ------------------------------------------------------------------------
-    // 0x10
-    //
-    // FIGA control register
-    // ------------------------------------------------------------------------
+    localparam bit [5:0] TRNG_REQ_SW               = 6'h09; // 0x24
 
-    localparam bit [5:0] TRNG_FIGA_CTRL =
-        6'h04;
+    localparam bit [5:0] TRNG_CLEAR_FAIL_STATE     = 6'h0A; // 0x28
+    localparam bit [5:0] TRNG_CLEAR_START_FINISH   = 6'h0B; // 0x2C
+    localparam bit [5:0] TRNG_CLEAR_COND_FINISH    = 6'h0C; // 0x30
 
+    localparam bit [5:0] TRNG_BYPASS_START_TEST    = 6'h0D; // 0x34
 
-    // ------------------------------------------------------------------------
-    // 0x14
-    //
-    // TRNG control
-    // ------------------------------------------------------------------------
+    localparam bit [5:0] TRNG_START_THRESHOLD      = 6'h0E; // 0x38
+    localparam bit [5:0] TRNG_REP_THRESHOLD        = 6'h0F; // 0x3C
+    localparam bit [5:0] TRNG_ADAPT_THRESHOLD      = 6'h10; // 0x40
 
-    localparam bit [5:0] TRNG_CTRL =
-        6'h05;
+    localparam bit [5:0] TRNG_SW_RESET             = 6'h11; // 0x44
 
+    localparam bit [5:0] TRNG_DEBUG_MODE           = 6'h12; // 0x48
+    localparam bit [5:0] TRNG_HEALTH_DEBUG_MODE    = 6'h13; // 0x4C
+    localparam bit [5:0] TRNG_COND_DEBUG_MODE      = 6'h14; // 0x50
 
-    // ------------------------------------------------------------------------
-    // 0x18
-    //
-    // FIGA output select
-    // ------------------------------------------------------------------------
+    localparam bit [5:0] TRNG_STATUS               = 6'h15; // 0x54
 
-    localparam bit [5:0] TRNG_FIGA_OUT_SEL =
-        6'h06;
+    // Conditioning random number readback
+    localparam bit [5:0] TRNG_RANDOM_31_0          = 6'h18;
+    localparam bit [5:0] TRNG_RANDOM_63_32         = 6'h19;
+    localparam bit [5:0] TRNG_RANDOM_95_64         = 6'h1A;
+    localparam bit [5:0] TRNG_RANDOM_127_96        = 6'h1B;
 
-
-    // ------------------------------------------------------------------------
-    // 0x1C
-    //
-    // SW FIGA enable mode
-    // ------------------------------------------------------------------------
-
-    localparam bit [5:0] TRNG_SW_FIGA_ENABLE_MODE =
-        6'h07;
-
-
-    // ------------------------------------------------------------------------
-    // 0x20
-    //
-    // SW FIGA local enable
-    // ------------------------------------------------------------------------
-
-    localparam bit [5:0] TRNG_SW_FIGA_LOCAL_ENABLE =
-        6'h08;
-
-
-    // ------------------------------------------------------------------------
-    // 0x24
-    //
-    // Software TRNG request
-    //
-    // Register description：
-    //
-    // write one pulse
-    //
-    // 所以只需要 write 1。
-    // ------------------------------------------------------------------------
-
-    localparam bit [5:0] TRNG_REQ_SW =
-        6'h09;
-
-
-    // ------------------------------------------------------------------------
-    // 0x28
-    //
-    // Clear health-test fail state
-    //
-    // write one pulse
-    // ------------------------------------------------------------------------
-
-    localparam bit [5:0] TRNG_CLEAR_FAIL_STATE =
-        6'h0A;
-
-
-    // ------------------------------------------------------------------------
-    // 0x2C
-    //
-    // Clear startup-test finish state
-    //
-    // write one pulse
-    // ------------------------------------------------------------------------
-
-    localparam bit [5:0] TRNG_CLEAR_START_FINISH =
-        6'h0B;
-
-
-    // ------------------------------------------------------------------------
-    // 0x30
-    //
-    // Clear conditioning finish state
-    //
-    // write one pulse
-    // ------------------------------------------------------------------------
-
-    localparam bit [5:0] TRNG_CLEAR_COND_FINISH =
-        6'h0C;
-
-
-    // ------------------------------------------------------------------------
-    // 0x34
-    //
-    // bypass startup health test
-    // ------------------------------------------------------------------------
-
-    localparam bit [5:0] TRNG_BYPASS_START_TEST =
-        6'h0D;
-
-
-    // ------------------------------------------------------------------------
-    // 0x38
-    //
-    // Startup-test threshold
-    // ------------------------------------------------------------------------
-
-    localparam bit [5:0] TRNG_START_TEST_THRESHOLD =
-        6'h0E;
-
-
-    // ------------------------------------------------------------------------
-    // 0x3C
-    //
-    // Repetition-test threshold
-    // ------------------------------------------------------------------------
-
-    localparam bit [5:0] TRNG_REPETITION_THRESHOLD =
-        6'h0F;
-
-
-    // ------------------------------------------------------------------------
-    // 0x40
-    //
-    // Adaptive-test threshold
-    // ------------------------------------------------------------------------
-
-    localparam bit [5:0] TRNG_ADAPT_THRESHOLD =
-        6'h10;
-
-
-    // ------------------------------------------------------------------------
-    // 0x44
-    //
-    // TRNG software reset
-    //
-    // write one pulse
-    // ------------------------------------------------------------------------
-
-    localparam bit [5:0] TRNG_SW_RESET =
-        6'h11;
-
-
-    // ------------------------------------------------------------------------
-    // 0x48
-    //
-    // TRNG debug mode
-    // ------------------------------------------------------------------------
-
-    localparam bit [5:0] TRNG_DEBUG_MODE =
-        6'h12;
-
-
-    // ------------------------------------------------------------------------
-    // 0x4C
-    //
-    // Health-test debug mode
-    //
-    // 使用 SW_TRNG_DATA 當 health-test input
-    // ------------------------------------------------------------------------
-
-    localparam bit [5:0] TRNG_HEALTH_DEBUG_MODE =
-        6'h13;
-
-
-    // ------------------------------------------------------------------------
-    // 0x50
-    //
-    // Conditioning-test debug mode
-    //
-    // 注意：
-    //
-    // 必須 startup test 完成後才能 enable。
-    // ------------------------------------------------------------------------
-
-    localparam bit [5:0] TRNG_COND_DEBUG_MODE =
-        6'h14;
-
-
-    // ------------------------------------------------------------------------
-    // 0x54
-    //
-    // TRNG STATUS
-    // ------------------------------------------------------------------------
-
-    localparam bit [5:0] TRNG_STATUS =
-        6'h15;
-
-
-    // ------------------------------------------------------------------------
-    // 0x80 ~ 0xBC
-    //
     // SW_TRNG_DATA[511:0]
+    localparam bit [5:0] TRNG_SW_DATA_BASE         = 6'h20;
+
+
+    // ========================================================================
+    // STATUS[7:0]
+    // ========================================================================
+
+    localparam int START_REP_ONE_FAIL_BIT  = 7;
+    localparam int START_REP_ZERO_FAIL_BIT = 6;
+    localparam int START_ADAPT_FAIL_BIT    = 5;
+
+    localparam int REP_ONE_FAIL_BIT        = 4;
+    localparam int REP_ZERO_FAIL_BIT       = 3;
+    localparam int ADAPT_FAIL_BIT          = 2;
+
+    localparam int START_FINISH_BIT        = 1;
+    localparam int COND_FINISH_BIT         = 0;
+
+
+    // ========================================================================
+    // STATUS 其他 field
     //
-    // word 6'h20 = [31:0]
-    // word 6'h21 = [63:32]
-    // ...
-    // word 6'h2F = [511:480]
-    // ------------------------------------------------------------------------
-
-    localparam bit [5:0] TRNG_SW_DATA_BASE =
-        6'h20;
-
-
-
-    // ========================================================================
-    // STATUS REGISTER BIT DEFINITION
+    // 由 register RTL concat 推回：
     //
-    // TRNG_STATUS @ 0x54
-    //
+    // [31:27] reserved
+    // [26:24] trng_cs
+    // [23:19] reserved
+    // [18:8]  adaptation_test_fail_value
+    // [7:0]   health / finish status
     // ========================================================================
 
-
-    // Startup repetition-one test fail
-    localparam int START_REP_ONE_FAIL_BIT =
-        7;
-
-
-    // Startup repetition-zero test fail
-    localparam int START_REP_ZERO_FAIL_BIT =
-        6;
-
-
-    // Startup adaptive test fail
-    localparam int START_ADAPT_FAIL_BIT =
-        5;
-
-
-    // Runtime repetition-one test fail
-    localparam int REP_ONE_FAIL_BIT =
-        4;
-
-
-    // Runtime repetition-zero test fail
-    localparam int REP_ZERO_FAIL_BIT =
-        3;
-
-
-    // Runtime adaptive test fail
-    localparam int ADAPT_FAIL_BIT =
-        2;
-
-
-    // Startup test finish
-    localparam int START_TEST_FINISH_BIT =
-        1;
-
-
-    // Conditioning finish
-    localparam int CONDITIONING_FINISH_BIT =
-        0;
-
+    localparam int TRNG_CS_MSB = 26;
+    localparam int TRNG_CS_LSB = 24;
 
 
     // ========================================================================
-    // DEFAULT THRESHOLD
-    //
-    // 這三個值來自你原本 legacy test。
-    //
+    // 原 legacy test / RTL threshold
     // ========================================================================
 
-    localparam bit [31:0] START_TEST_THRESHOLD_VALUE =
-        32'd300;
-
-
-    localparam bit [31:0] REPETITION_THRESHOLD_VALUE =
-        32'd35;
-
-
-    localparam bit [31:0] ADAPT_THRESHOLD_VALUE =
-        32'd748;
-
+    localparam bit [31:0] START_THRESHOLD_VALUE = 32'd300;
+    localparam bit [31:0] REP_THRESHOLD_VALUE   = 32'd35;
+    localparam bit [31:0] ADAPT_THRESHOLD_VALUE = 32'd748;
 
 
     // ========================================================================
-    // TIMEOUT
-    //
-    // polling 最多等待 10000 個 TRNG clock。
-    //
+    // Timeout
     // ========================================================================
 
-    localparam int TRNG_TIMEOUT_CYCLE =
-        10000;
-
+    localparam int TRNG_TIMEOUT_CYCLE = 20000;
 
 
     // ========================================================================
-    // INTERNAL DATA
+    // Test variables
     // ========================================================================
 
-    bit [31:0] status;
+    bit [31:0]  status;
 
     bit [511:0] normal_data;
+    bit [511:0] rep_one_data;
+    bit [511:0] rep_zero_data;
+    bit [511:0] adaptive_data;
 
-    bit [511:0] all_one_data;
+    bit [511:0] conditioning_data;
 
-    bit [511:0] all_zero_data;
-
-    bit [511:0] adaptive_one_data;
-
-    bit [511:0] adaptive_zero_data;
-
+    bit [127:0] conditioning_result;
 
 
     // ========================================================================
-    // CONSTRUCTOR
+    // Constructor
     // ========================================================================
 
     function new(
@@ -371,38 +182,24 @@ class mcu_trng_test extends host_base_test;
         uvm_component parent = null
     );
 
-        super.new(
-            name,
-            parent
-        );
+        super.new(name, parent);
 
     endfunction
 
 
-
     // ========================================================================
-    // BUILD PHASE
+    // build_phase
     // ========================================================================
 
-    virtual function void build_phase(
-        uvm_phase phase
-    );
+    virtual function void build_phase(uvm_phase phase);
 
-        super.build_phase(
-            phase
-        );
+        super.build_phase(phase);
 
     endfunction
 
 
-
     // ========================================================================
-    // REGISTER WRITE WRAPPER
-    //
-    // 所有 TRNG register write 統一從這裡出去。
-    //
-    // 這樣之後如果改 RAL，只需要修改這裡。
-    //
+    // Register write wrapper
     // ========================================================================
 
     virtual task trng_write(
@@ -413,7 +210,7 @@ class mcu_trng_test extends host_base_test;
         `uvm_info(
             "TRNG_REG",
             $sformatf(
-                "WRITE word_addr=0x%02h byte_offset=0x%02h data=0x%08h",
+                "WRITE word=0x%02h byte_offset=0x%02h data=0x%08h",
                 word_addr,
                 {word_addr, 2'b00},
                 data
@@ -432,13 +229,8 @@ class mcu_trng_test extends host_base_test;
     endtask
 
 
-
     // ========================================================================
-    // REGISTER READ WRAPPER
-    //
-    // 如果你們 ahb_word_read() 的 output parameter 順序不同，
-    // 只需要改這一個 task。
-    //
+    // Register read wrapper
     // ========================================================================
 
     virtual task trng_read(
@@ -457,7 +249,7 @@ class mcu_trng_test extends host_base_test;
         `uvm_info(
             "TRNG_REG",
             $sformatf(
-                "READ word_addr=0x%02h byte_offset=0x%02h data=0x%08h",
+                "READ word=0x%02h byte_offset=0x%02h data=0x%08h",
                 word_addr,
                 {word_addr, 2'b00},
                 data
@@ -468,136 +260,178 @@ class mcu_trng_test extends host_base_test;
     endtask
 
 
-
     // ========================================================================
-    // BUILD TEST PATTERN
+    // 建立 deterministic pattern
     // ========================================================================
 
     virtual task build_test_pattern();
 
+        // --------------------------------------------------------------------
+        // Normal data
+        //
+        // AA = 10101010
+        //
+        // 特性：
+        //
+        // 1/0 比例完全 50/50。
+        // 最大連續 1 = 1。
+        // 最大連續 0 = 1。
+        //
+        // 對 repetition threshold=35 非常安全。
+        //
+        // 1024-bit adaptive window：
+        //
+        // one_count = 512
+        //
+        // PASS range：
+        //
+        // 1024 - 748 = 276
+        //
+        // 276 <= 512 <= 748
+        //
+        // 所以理論上必須 PASS。
+        // --------------------------------------------------------------------
+
+        normal_data = {64{8'hAA}};
+
 
         // --------------------------------------------------------------------
-        // Normal pattern
+        // Repetition-one
         //
-        // 避免長時間全部 0 或全部 1。
+        // FF FF FF ...
         //
-        // 用來測正常 health-test 與 conditioning。
+        // 會產生大量連續 1。
         // --------------------------------------------------------------------
 
-        normal_data = {
-            32'h1357_9BDF,
-            32'h2468_ACE0,
-            32'hCAFE_BABE,
-            32'hDEAD_BEEF,
+        rep_one_data = {64{8'hFF}};
 
-            32'h55AA_33CC,
-            32'h0F0F_F0F0,
-            32'h1234_5678,
-            32'h8765_4321,
 
-            32'hA5A5_5A5A,
+        // --------------------------------------------------------------------
+        // Repetition-zero
+        //
+        // 00 00 00 ...
+        // --------------------------------------------------------------------
+
+        rep_zero_data = {64{8'h00}};
+
+
+        // --------------------------------------------------------------------
+        // Adaptive fail
+        //
+        // EE = 1110_1110
+        //
+        // one ratio = 75%
+        //
+        // 1024 * 75% = 768
+        //
+        // 768 > threshold 748
+        //
+        // 所以理論上觸發 adaptive fail。
+        //
+        // 但最大連續 1 只有 3，
+        // 低於 repetition threshold 35。
+        // --------------------------------------------------------------------
+
+        adaptive_data = {64{8'hEE}};
+
+
+        // --------------------------------------------------------------------
+        // Conditioning input
+        //
+        // conditioning debug mode 直接 mux SW_TRNG_DATA。
+        //
+        // 這裡使用固定 pattern，
+        // 方便 waveform debug。
+        // --------------------------------------------------------------------
+
+        conditioning_data = {
+            32'h0123_4567,
+            32'h89AB_CDEF,
             32'h1020_3040,
+            32'h5060_7080,
+
             32'h1122_3344,
             32'h5566_7788,
+            32'h99AA_BBCC,
+            32'hDDEE_FF00,
 
-            32'h89AB_CDEF,
-            32'h7654_3210,
-            32'hAA55_AA55,
-            32'h5A5A_A5A5
+            32'hCAFE_BABE,
+            32'hDEAD_BEEF,
+            32'h1357_9BDF,
+            32'h2468_ACE0,
+
+            32'hA5A5_5A5A,
+            32'h0F0F_F0F0,
+            32'h55AA_33CC,
+            32'hC3C3_3C3C
         };
-
-
-        // --------------------------------------------------------------------
-        // All one
-        //
-        // 用來刺激 repetition-one detector。
-        // --------------------------------------------------------------------
-
-        all_one_data =
-            {512{1'b1}};
-
-
-        // --------------------------------------------------------------------
-        // All zero
-        //
-        // 用來刺激 repetition-zero detector。
-        // --------------------------------------------------------------------
-
-        all_zero_data =
-            {512{1'b0}};
-
-
-        // --------------------------------------------------------------------
-        // Adaptive ONE-biased pattern
-        //
-        // pattern：
-        //
-        // 1110 1110 1110 ...
-        //
-        // 1 的比例較高，但連續 1 最長只有 3。
-        //
-        // 這比全部 1 更適合拿來刺激 adaptive detector。
-        // --------------------------------------------------------------------
-
-        for (
-            int i = 0;
-            i < 512;
-            i += 4
-        ) begin
-
-            adaptive_one_data[i +: 4] =
-                4'b1110;
-
-        end
-
-
-        // --------------------------------------------------------------------
-        // Adaptive ZERO-biased pattern
-        //
-        // pattern：
-        //
-        // 0001 0001 0001 ...
-        //
-        // --------------------------------------------------------------------
-
-        for (
-            int i = 0;
-            i < 512;
-            i += 4
-        ) begin
-
-            adaptive_zero_data[i +: 4] =
-                4'b0001;
-
-        end
 
     endtask
 
 
+    // ========================================================================
+    // Read TRNG status
+    // ========================================================================
+
+    virtual task read_status(
+        output bit [31:0] data
+    );
+
+        trng_read(
+            TRNG_STATUS,
+            data
+        );
+
+    endtask
+
 
     // ========================================================================
-    // WRITE SW_TRNG_DATA
-    //
-    // 512-bit data 拆成 16 個 32-bit register。
-    //
+    // Print status decode
+    // ========================================================================
+
+    virtual task print_status(
+        input string tag = "TRNG_STATUS"
+    );
+
+        read_status(status);
+
+
+        `uvm_info(
+            tag,
+            $sformatf(
+                {"status=0x%08h  "
+                 "cs=0x%0h  "
+                 "start_rep1=%0b start_rep0=%0b start_adapt=%0b  "
+                 "rep1=%0b rep0=%0b adapt=%0b  "
+                 "start_finish=%0b cond_finish=%0b  "
+                 "adapt_fail_value=%0d"},
+                status,
+                status[TRNG_CS_MSB:TRNG_CS_LSB],
+                status[START_REP_ONE_FAIL_BIT],
+                status[START_REP_ZERO_FAIL_BIT],
+                status[START_ADAPT_FAIL_BIT],
+                status[REP_ONE_FAIL_BIT],
+                status[REP_ZERO_FAIL_BIT],
+                status[ADAPT_FAIL_BIT],
+                status[START_FINISH_BIT],
+                status[COND_FINISH_BIT],
+                status[18:8]
+            ),
+            UVM_LOW
+        )
+
+    endtask
+
+
+    // ========================================================================
+    // Write SW_TRNG_DATA
     // ========================================================================
 
     virtual task write_sw_trng_data(
         input bit [511:0] data
     );
 
-        `uvm_info(
-            "TRNG_DATA",
-            "Write SW_TRNG_DATA[511:0]",
-            UVM_MEDIUM
-        )
-
-
-        for (
-            int i = 0;
-            i < 16;
-            i++
-        ) begin
+        for (int i = 0; i < 16; i++) begin
 
             trng_write(
                 TRNG_SW_DATA_BASE + i,
@@ -609,34 +443,63 @@ class mcu_trng_test extends host_base_test;
     endtask
 
 
-
     // ========================================================================
-    // SW REQUEST
+    // Enable / Disable FIGA
     //
-    // Manual mode 使用 trng_req_sw。
+    // RTL：
     //
+    // assign figa_enable = reg_04_ctrl[7];
+    //
+    // 所以：
+    //
+    // enable = 0x80
+    // disable = 0x00
     // ========================================================================
 
-    virtual task trigger_trng();
+    virtual task set_figa_enable(
+        input bit enable
+    );
 
-        `uvm_info(
-            "TRNG_TRIGGER",
-            "Trigger TRNG by TRNG_REQ_SW",
-            UVM_MEDIUM
-        )
+        if (enable) begin
 
+            trng_write(
+                TRNG_FIGA_CTRL,
+                32'h0000_0080
+            );
 
-        trng_write(
-            TRNG_REQ_SW,
-            32'h0000_0001
-        );
+        end
+        else begin
+
+            trng_write(
+                TRNG_FIGA_CTRL,
+                32'h0000_0000
+            );
+
+        end
 
     endtask
 
 
+    // ========================================================================
+    // TRNG software reset pulse
+    // ========================================================================
+
+    virtual task trng_sw_reset();
+
+        trng_write(
+            TRNG_SW_RESET,
+            32'h1
+        );
+
+
+        repeat(4)
+            @(posedge system.sscg_clk);
+
+    endtask
+
 
     // ========================================================================
-    // CLEAR FUNCTIONS
+    // Clear command
     // ========================================================================
 
     virtual task clear_fail_state();
@@ -649,7 +512,6 @@ class mcu_trng_test extends host_base_test;
     endtask
 
 
-
     virtual task clear_start_finish();
 
         trng_write(
@@ -658,7 +520,6 @@ class mcu_trng_test extends host_base_test;
         );
 
     endtask
-
 
 
     virtual task clear_conditioning_finish();
@@ -671,15 +532,7 @@ class mcu_trng_test extends host_base_test;
     endtask
 
 
-
     virtual task clear_all_status();
-
-        `uvm_info(
-            "TRNG_CLEAR",
-            "Clear TRNG fail/finish status",
-            UVM_MEDIUM
-        )
-
 
         clear_fail_state();
 
@@ -688,47 +541,283 @@ class mcu_trng_test extends host_base_test;
         clear_conditioning_finish();
 
 
+        repeat(3)
+            @(posedge system.sscg_clk);
+
+    endtask
+
+
+    // ========================================================================
+    // Restore normal threshold
+    // ========================================================================
+
+    virtual task restore_threshold();
+
+        trng_write(
+            TRNG_START_THRESHOLD,
+            START_THRESHOLD_VALUE
+        );
+
+        trng_write(
+            TRNG_REP_THRESHOLD,
+            REP_THRESHOLD_VALUE
+        );
+
+        trng_write(
+            TRNG_ADAPT_THRESHOLD,
+            ADAPT_THRESHOLD_VALUE
+        );
+
+    endtask
+
+
+    // ========================================================================
+    // Health Debug Data Loader
+    //
+    // RTL 已確認：
+    //
+    // health_test_debug_mode 0 -> 1 時，
+    //
+    // debug_trng_data <= SW_TRNG_DATA
+    //
+    // 因此順序一定必須：
+    //
+    // 1. mode = 0
+    // 2. write SW_TRNG_DATA
+    // 3. mode = 1
+    //
+    // Pattern 全部使用相同 byte repeated，
+    // 因此後續 8-bit rotate 不影響內容。
+    // ========================================================================
+
+    virtual task load_health_debug_data(
+        input bit [511:0] data
+    );
+
+        // 一定先回 0。
+        trng_write(
+            TRNG_HEALTH_DEBUG_MODE,
+            32'h0
+        );
+
+
+        repeat(2)
+            @(posedge system.sscg_clk);
+
+
+        // Data 必須在 rising pulse 前先準備完成。
+        write_sw_trng_data(
+            data
+        );
+
+
+        repeat(2)
+            @(posedge system.sscg_clk);
+
+
+        // 0 -> 1
+        //
+        // 產生 health debug capture pulse。
+        trng_write(
+            TRNG_HEALTH_DEBUG_MODE,
+            32'h1
+        );
+
+
         repeat(2)
             @(posedge system.sscg_clk);
 
     endtask
 
 
-
     // ========================================================================
-    // READ STATUS
+    // Common case preparation
+    //
+    // 每個 case 都重新 reset TRNG internal state，
+    // 避免上一個 test 的 counter / FSM / sticky flag 干擾下一個 case。
     // ========================================================================
 
-    virtual task read_trng_status(
-        output bit [31:0] data
+    virtual task prepare_case(
+        input bit bypass_start_test
     );
 
-        trng_read(
-            TRNG_STATUS,
-            data
+        // ------------------------------------------------------------
+        // 先關 FIGA。
+        //
+        // 避免 configuration 還沒設完 FSM 就開始跑。
+        // ------------------------------------------------------------
+
+        set_figa_enable(1'b0);
+
+
+        // ------------------------------------------------------------
+        // Reset internal TRNG state。
+        // ------------------------------------------------------------
+
+        trng_sw_reset();
+
+
+        // ------------------------------------------------------------
+        // 關所有 debug path。
+        // ------------------------------------------------------------
+
+        trng_write(
+            TRNG_DEBUG_MODE,
+            32'h0
         );
+
+        trng_write(
+            TRNG_HEALTH_DEBUG_MODE,
+            32'h0
+        );
+
+        trng_write(
+            TRNG_COND_DEBUG_MODE,
+            32'h0
+        );
+
+
+        // ------------------------------------------------------------
+        // 原本額外 FIGA control 保持 legacy setting。
+        // ------------------------------------------------------------
+
+        trng_write(
+            TRNG_CTRL,
+            32'h0
+        );
+
+        trng_write(
+            TRNG_FIGA_OUT_SEL,
+            32'h0
+        );
+
+        trng_write(
+            TRNG_SW_FIGA_ENABLE_MODE,
+            32'h0
+        );
+
+        trng_write(
+            TRNG_SW_FIGA_LOCAL_ENABLE,
+            32'h0
+        );
+
+
+        // ------------------------------------------------------------
+        // Normal thresholds。
+        // ------------------------------------------------------------
+
+        restore_threshold();
+
+
+        // ------------------------------------------------------------
+        // Startup bypass mode。
+        // ------------------------------------------------------------
+
+        trng_write(
+            TRNG_BYPASS_START_TEST,
+            bypass_start_test
+        );
+
+
+        clear_all_status();
 
     endtask
 
 
+    // ========================================================================
+    // Wait normal startup test finish
+    //
+    // 正常 case：
+    //
+    // expected:
+    //
+    // start_test_finish = 1
+    // 所有 error = 0
+    //
+    // 如果 error 先出現，不要繼續 polling 20000 次，
+    // 直接 fatal 把真正 status 印出來。
+    // ========================================================================
+
+    virtual task wait_normal_start_finish();
+
+        bit done;
+
+        done = 0;
+
+
+        for (int i = 0; i < TRNG_TIMEOUT_CYCLE; i++) begin
+
+            read_status(status);
+
+
+            // 正常進 HEALTH_TEST。
+            if (status[START_FINISH_BIT] === 1'b1) begin
+
+                done = 1;
+
+                break;
+
+            end
+
+
+            // Normal pattern 不可以有任何 health error。
+            if (status[7:2] !== 6'b0) begin
+
+                print_status(
+                    "NORMAL_START_FAIL"
+                );
+
+                `uvm_fatal(
+                    "TRNG_NORMAL",
+                    "Normal startup health test unexpectedly failed"
+                )
+
+            end
+
+
+            @(posedge system.sscg_clk);
+
+        end
+
+
+        if (!done) begin
+
+            print_status(
+                "START_TIMEOUT"
+            );
+
+            `uvm_fatal(
+                "TRNG_TIMEOUT",
+                "Timeout waiting for start_test_finish"
+            )
+
+        end
+
+
+        // finish 之後再確認一次。
+        if (status[7:2] !== 6'b0) begin
+
+            print_status(
+                "START_FINISH_ERROR"
+            );
+
+            `uvm_fatal(
+                "TRNG_NORMAL",
+                "Health error found after start_test_finish"
+            )
+
+        end
+
+    endtask
+
 
     // ========================================================================
-    // WAIT STATUS BIT
-    //
-    // 使用 polling + timeout。
-    //
-    // 不直接：
-    //
-    // wait(status_bit);
-    //
-    // 避免 DUT bug 時 simulation 永久卡住。
-    //
+    // Generic wait error flag
     // ========================================================================
 
-    virtual task wait_status_bit(
+    virtual task wait_error_flag(
         input int bit_idx,
-        input bit exp_value = 1'b1,
-        input int timeout_cycle = TRNG_TIMEOUT_CYCLE
+        input string flag_name
     );
 
         bit hit;
@@ -736,22 +825,12 @@ class mcu_trng_test extends host_base_test;
         hit = 0;
 
 
-        for (
-            int i = 0;
-            i < timeout_cycle;
-            i++
-        ) begin
+        for (int i = 0; i < TRNG_TIMEOUT_CYCLE; i++) begin
 
-            read_trng_status(
-                status
-            );
+            read_status(status);
 
 
-            if (
-                status[bit_idx]
-                ===
-                exp_value
-            ) begin
+            if (status[bit_idx] === 1'b1) begin
 
                 hit = 1;
 
@@ -767,75 +846,60 @@ class mcu_trng_test extends host_base_test;
 
         if (!hit) begin
 
+            print_status(
+                "ERROR_TIMEOUT"
+            );
+
             `uvm_fatal(
-                "TRNG_TIMEOUT",
+                "TRNG_ERROR_TIMEOUT",
                 $sformatf(
-                    "Timeout waiting status[%0d]=%0b, last_status=0x%08h",
-                    bit_idx,
-                    exp_value,
-                    status
+                    "Expected flag %s did not assert",
+                    flag_name
                 )
             )
 
         end
+
+
+        `uvm_info(
+            "TRNG_ERROR",
+            $sformatf(
+                "%s asserted correctly, status=0x%08h",
+                flag_name,
+                status
+            ),
+            UVM_LOW
+        )
 
     endtask
 
 
-
     // ========================================================================
-    // CHECK TARGET ERROR FLAG
-    //
-    // 只確認 target flag 必須起來。
-    //
-    // 不強制其他 detector 一定保持 0。
-    //
-    // 原因：
-    //
-    // repetition 與 adaptive detector 可能同時被同一組 pathological
-    // pattern 刺激。
-    //
-    // 如果 RTL spec 明確保證 mutually exclusive，
-    // 再把其他 flag check 加進來。
-    //
+    // Check health error all clear
     // ========================================================================
 
-    virtual task check_target_flag(
-        input int bit_idx,
-        input string flag_name
-    );
+    virtual task check_health_error_clear();
 
-        read_trng_status(
-            status
-        );
+        read_status(status);
 
 
-        if (
-            status[bit_idx]
-            !==
-            1'b1
-        ) begin
+        if (status[7:2] !== 6'b0) begin
+
+            print_status(
+                "CLEAR_FAIL"
+            );
 
             `uvm_error(
-                "TRNG_FLAG",
-                $sformatf(
-                    "%s should assert, status=0x%08h",
-                    flag_name,
-                    status
-                )
+                "TRNG_CLEAR",
+                "Health error flags are not cleared"
             )
 
         end
-
         else begin
 
             `uvm_info(
-                "TRNG_FLAG",
-                $sformatf(
-                    "%s asserted correctly, status=0x%08h",
-                    flag_name,
-                    status
-                ),
+                "TRNG_CLEAR",
+                "All health error flags are clear",
                 UVM_LOW
             )
 
@@ -844,765 +908,526 @@ class mcu_trng_test extends host_base_test;
     endtask
 
 
-
     // ========================================================================
-    // CHECK ALL ERROR FLAG CLEAR
-    // ========================================================================
-
-    virtual task check_all_error_clear();
-
-        read_trng_status(
-            status
-        );
-
-
-        // status[7:2] 全部都是 health-test error。
-        if (
-            status[7:2]
-            !==
-            6'b000000
-        ) begin
-
-            `uvm_error(
-                "TRNG_CLEAR",
-                $sformatf(
-                    "Health error flags are not cleared, status=0x%08h",
-                    status
-                )
-            )
-
-        end
-
-        else begin
-
-            `uvm_info(
-                "TRNG_CLEAR",
-                "All health error flags are cleared",
-                UVM_MEDIUM
-            )
-
-        end
-
-    endtask
-
-
-
-    // ========================================================================
-    // RESTORE NORMAL THRESHOLD
+    // Read conditioning result
     // ========================================================================
 
-    virtual task restore_normal_threshold();
+    virtual task read_conditioning_result(
+        output bit [127:0] result
+    );
 
-        trng_write(
-            TRNG_START_TEST_THRESHOLD,
-            START_TEST_THRESHOLD_VALUE
+        bit [31:0] d0;
+        bit [31:0] d1;
+        bit [31:0] d2;
+        bit [31:0] d3;
+
+
+        trng_read(
+            TRNG_RANDOM_31_0,
+            d0
+        );
+
+        trng_read(
+            TRNG_RANDOM_63_32,
+            d1
+        );
+
+        trng_read(
+            TRNG_RANDOM_95_64,
+            d2
+        );
+
+        trng_read(
+            TRNG_RANDOM_127_96,
+            d3
         );
 
 
-        trng_write(
-            TRNG_REPETITION_THRESHOLD,
-            REPETITION_THRESHOLD_VALUE
-        );
-
-
-        trng_write(
-            TRNG_ADAPT_THRESHOLD,
-            ADAPT_THRESHOLD_VALUE
-        );
-
-    endtask
-
-
-
-    // ========================================================================
-    // TRNG INITIALIZATION
-    // ========================================================================
-
-    virtual task trng_init();
-
-        `uvm_info(
-            "TRNG_INIT",
-            "Initialize TRNG",
-            UVM_LOW
-        )
-
-
-        // --------------------------------------------------------------------
-        // FIGA control
-        //
-        // 沿用你原 legacy test 的設定。
-        // --------------------------------------------------------------------
-
-        trng_write(
-            TRNG_FIGA_CTRL,
-            32'h0000_0000
-        );
-
-
-        trng_write(
-            TRNG_CTRL,
-            32'h0000_0000
-        );
-
-
-        trng_write(
-            TRNG_FIGA_OUT_SEL,
-            32'h0000_0000
-        );
-
-
-        trng_write(
-            TRNG_SW_FIGA_ENABLE_MODE,
-            32'h0000_0000
-        );
-
-
-        trng_write(
-            TRNG_SW_FIGA_LOCAL_ENABLE,
-            32'h0000_0000
-        );
-
-
-        // --------------------------------------------------------------------
-        // Threshold
-        // --------------------------------------------------------------------
-
-        restore_normal_threshold();
-
-
-        // --------------------------------------------------------------------
-        // Disable test/debug mode initially
-        // --------------------------------------------------------------------
-
-        trng_write(
-            TRNG_DEBUG_MODE,
-            32'h0000_0000
-        );
-
-
-        trng_write(
-            TRNG_HEALTH_DEBUG_MODE,
-            32'h0000_0000
-        );
-
-
-        trng_write(
-            TRNG_COND_DEBUG_MODE,
-            32'h0000_0000
-        );
-
-
-        // --------------------------------------------------------------------
-        // 不 bypass startup test
-        // --------------------------------------------------------------------
-
-        trng_write(
-            TRNG_BYPASS_START_TEST,
-            32'h0000_0000
-        );
-
-
-        // --------------------------------------------------------------------
-        // Clear previous status
-        // --------------------------------------------------------------------
-
-        clear_all_status();
+        result = {
+            d3,
+            d2,
+            d1,
+            d0
+        };
 
 
         `uvm_info(
-            "TRNG_INIT",
-            "TRNG configuration completed",
+            "TRNG_RANDOM",
+            $sformatf(
+                "conditioning_random_number = 0x%032h",
+                result
+            ),
             UVM_LOW
         )
 
     endtask
-
 
 
     // ========================================================================
     // CASE 1
     //
-    // NORMAL HEALTH TEST
+    // VPlan:
     //
-    // VPlan：
+    // Use manual mode to test health test function works properly.
     //
-    // Use manual mode to test the health test function works properly.
-    //
+    // Normal startup health test。
     // ========================================================================
 
     virtual task test_health_normal();
 
         `uvm_info(
             "TRNG_CASE",
-            "========== CASE 1 : NORMAL HEALTH TEST ==========",
+            "==================================================",
+            UVM_LOW
+        )
+
+        `uvm_info(
+            "TRNG_CASE",
+            "CASE 1 : NORMAL MANUAL HEALTH TEST",
             UVM_LOW
         )
 
 
-        clear_all_status();
-
-        restore_normal_threshold();
-
-
-        // --------------------------------------------------------------------
-        // 不 bypass startup test
-        // --------------------------------------------------------------------
-
-        trng_write(
-            TRNG_BYPASS_START_TEST,
-            32'h0
+        prepare_case(
+            1'b0
         );
 
 
-        // --------------------------------------------------------------------
-        // Enable health-test SW data mode
-        // --------------------------------------------------------------------
+        // ------------------------------------------------------------
+        // 先把 AA pattern capture 到 debug_trng_data。
+        //
+        // 此時 FIGA 還是 disable，
+        // 所以 START_TEST 不會偷跑。
+        // ------------------------------------------------------------
 
-        trng_write(
-            TRNG_HEALTH_DEBUG_MODE,
-            32'h1
-        );
-
-
-        trng_write(
-            TRNG_COND_DEBUG_MODE,
-            32'h0
-        );
-
-
-        // --------------------------------------------------------------------
-        // 寫入正常 SW TRNG data
-        // --------------------------------------------------------------------
-
-        write_sw_trng_data(
+        load_health_debug_data(
             normal_data
         );
 
 
-        // --------------------------------------------------------------------
-        // Software manual trigger
-        // --------------------------------------------------------------------
+        // ------------------------------------------------------------
+        // 所有設定完成後最後才 enable FIGA。
+        //
+        // FSM：
+        //
+        // IDLE
+        //   -> start counter
+        //   -> START_TEST
+        //   -> HEALTH_TEST
+        // ------------------------------------------------------------
 
-        trigger_trng();
-
-
-        // --------------------------------------------------------------------
-        // 等 startup health test 完成
-        // --------------------------------------------------------------------
-
-        wait_status_bit(
-            START_TEST_FINISH_BIT,
+        set_figa_enable(
             1'b1
         );
 
 
-        // --------------------------------------------------------------------
-        // 正常情況下 error flag 應全部為 0
-        // --------------------------------------------------------------------
+        wait_normal_start_finish();
 
-        check_all_error_clear();
+
+        check_health_error_clear();
+
+
+        print_status(
+            "NORMAL_HEALTH_PASS"
+        );
 
 
         `uvm_info(
             "TRNG_CASE",
-            "CASE 1 PASS : Normal health test",
+            "CASE 1 PASS",
             UVM_LOW
         )
 
     endtask
 
 
-
     // ========================================================================
     // CASE 2
     //
-    // START REPETITION-ONE ERROR
-    //
+    // Startup repetition-one error
     // ========================================================================
 
     virtual task test_start_rep_one_error();
 
         `uvm_info(
             "TRNG_CASE",
-            "========== CASE 2 : START REPETITION ONE ==========",
+            "CASE 2 : START REPETITION-ONE ERROR",
             UVM_LOW
         )
 
 
-        clear_all_status();
-
-
-        trng_write(
-            TRNG_BYPASS_START_TEST,
-            32'h0
+        prepare_case(
+            1'b0
         );
 
 
-        trng_write(
-            TRNG_HEALTH_DEBUG_MODE,
-            32'h1
+        load_health_debug_data(
+            rep_one_data
         );
 
 
-        // --------------------------------------------------------------------
-        // 全 1 data
-        // --------------------------------------------------------------------
-
-        write_sw_trng_data(
-            all_one_data
-        );
-
-
-        trigger_trng();
-
-
-        // --------------------------------------------------------------------
-        // 等 startup repetition-one fail
-        // --------------------------------------------------------------------
-
-        wait_status_bit(
-            START_REP_ONE_FAIL_BIT,
+        set_figa_enable(
             1'b1
         );
 
 
-        check_target_flag(
+        wait_error_flag(
             START_REP_ONE_FAIL_BIT,
             "start_repetition_one_test_fail"
         );
 
 
-        // --------------------------------------------------------------------
-        // Clear error
-        // --------------------------------------------------------------------
+        // ------------------------------------------------------------
+        // START_TEST 到 block counter=127 後會因 startup fail 回 IDLE。
+        //
+        // 先關 FIGA，避免 IDLE 後重新開始下一輪 startup。
+        // ------------------------------------------------------------
+
+        set_figa_enable(
+            1'b0
+        );
+
+
+        repeat(300)
+            @(posedge system.sscg_clk);
+
+
+        // ------------------------------------------------------------
+        // 驗一次 clear_fail_state 的 software-visible 行為。
+        // ------------------------------------------------------------
 
         clear_fail_state();
 
 
-        repeat(2)
+        repeat(3)
             @(posedge system.sscg_clk);
 
 
-        check_all_error_clear();
+        check_health_error_clear();
 
     endtask
-
 
 
     // ========================================================================
     // CASE 3
     //
-    // START REPETITION-ZERO ERROR
-    //
+    // Startup repetition-zero error
     // ========================================================================
 
     virtual task test_start_rep_zero_error();
 
         `uvm_info(
             "TRNG_CASE",
-            "========== CASE 3 : START REPETITION ZERO ==========",
+            "CASE 3 : START REPETITION-ZERO ERROR",
             UVM_LOW
         )
 
 
-        clear_all_status();
-
-
-        trng_write(
-            TRNG_BYPASS_START_TEST,
-            32'h0
+        prepare_case(
+            1'b0
         );
 
 
-        trng_write(
-            TRNG_HEALTH_DEBUG_MODE,
-            32'h1
+        load_health_debug_data(
+            rep_zero_data
         );
 
 
-        write_sw_trng_data(
-            all_zero_data
-        );
-
-
-        trigger_trng();
-
-
-        wait_status_bit(
-            START_REP_ZERO_FAIL_BIT,
+        set_figa_enable(
             1'b1
         );
 
 
-        check_target_flag(
+        wait_error_flag(
             START_REP_ZERO_FAIL_BIT,
             "start_repetition_zero_test_fail"
         );
 
-
-        clear_fail_state();
-
-
-        repeat(2)
-            @(posedge system.sscg_clk);
-
-
-        check_all_error_clear();
-
     endtask
-
 
 
     // ========================================================================
     // CASE 4
     //
-    // START ADAPTIVE ERROR
+    // Startup adaptive error
     //
+    // EE repeated:
+    //
+    // one-count = 768 / 1024
+    // threshold = 748
+    //
+    // 最大 run = 3，所以不容易撞 repetition threshold=35。
     // ========================================================================
 
     virtual task test_start_adaptive_error();
 
         `uvm_info(
             "TRNG_CASE",
-            "========== CASE 4 : START ADAPTIVE ERROR ==========",
+            "CASE 4 : START ADAPTATION ERROR",
             UVM_LOW
         )
 
 
-        clear_all_status();
-
-
-        trng_write(
-            TRNG_BYPASS_START_TEST,
-            32'h0
+        prepare_case(
+            1'b0
         );
 
 
-        trng_write(
-            TRNG_HEALTH_DEBUG_MODE,
-            32'h1
+        load_health_debug_data(
+            adaptive_data
         );
 
 
-        // --------------------------------------------------------------------
-        // 使用偏向 1 的 pattern
-        //
-        // 1110 repeated
-        // --------------------------------------------------------------------
-
-        write_sw_trng_data(
-            adaptive_one_data
-        );
-
-
-        trigger_trng();
-
-
-        wait_status_bit(
-            START_ADAPT_FAIL_BIT,
+        set_figa_enable(
             1'b1
         );
 
 
-        check_target_flag(
+        wait_error_flag(
             START_ADAPT_FAIL_BIT,
             "start_adaptation_test_fail"
         );
 
 
-        clear_fail_state();
-
-
-        repeat(2)
-            @(posedge system.sscg_clk);
-
-
-        check_all_error_clear();
+        `uvm_info(
+            "TRNG_ADAPT",
+            $sformatf(
+                "adaptation_test_fail_value = %0d",
+                status[18:8]
+            ),
+            UVM_LOW
+        )
 
     endtask
-
 
 
     // ========================================================================
     // CASE 5
     //
-    // RUNTIME REPETITION-ONE ERROR
+    // Runtime repetition-one error
     //
+    // bypass_start_test=1:
+    //
+    // IDLE -> HEALTH_TEST
     // ========================================================================
 
     virtual task test_rep_one_error();
 
         `uvm_info(
             "TRNG_CASE",
-            "========== CASE 5 : REPETITION ONE ==========",
+            "CASE 5 : RUNTIME REPETITION-ONE ERROR",
             UVM_LOW
         )
 
 
-        clear_all_status();
-
-
-        // --------------------------------------------------------------------
-        // bypass startup test
-        //
-        // 這樣主要驗 continuous health test。
-        // --------------------------------------------------------------------
-
-        trng_write(
-            TRNG_BYPASS_START_TEST,
-            32'h1
-        );
-
-
-        trng_write(
-            TRNG_HEALTH_DEBUG_MODE,
-            32'h1
-        );
-
-
-        write_sw_trng_data(
-            all_one_data
-        );
-
-
-        trigger_trng();
-
-
-        wait_status_bit(
-            REP_ONE_FAIL_BIT,
+        prepare_case(
             1'b1
         );
 
 
-        check_target_flag(
+        load_health_debug_data(
+            rep_one_data
+        );
+
+
+        set_figa_enable(
+            1'b1
+        );
+
+
+        wait_error_flag(
             REP_ONE_FAIL_BIT,
             "repetition_one_test_fail"
         );
 
-
-        clear_fail_state();
-
-
-        repeat(2)
-            @(posedge system.sscg_clk);
-
-
-        check_all_error_clear();
-
     endtask
-
 
 
     // ========================================================================
     // CASE 6
     //
-    // RUNTIME REPETITION-ZERO ERROR
-    //
+    // Runtime repetition-zero error
     // ========================================================================
 
     virtual task test_rep_zero_error();
 
         `uvm_info(
             "TRNG_CASE",
-            "========== CASE 6 : REPETITION ZERO ==========",
+            "CASE 6 : RUNTIME REPETITION-ZERO ERROR",
             UVM_LOW
         )
 
 
-        clear_all_status();
-
-
-        trng_write(
-            TRNG_BYPASS_START_TEST,
-            32'h1
-        );
-
-
-        trng_write(
-            TRNG_HEALTH_DEBUG_MODE,
-            32'h1
-        );
-
-
-        write_sw_trng_data(
-            all_zero_data
-        );
-
-
-        trigger_trng();
-
-
-        wait_status_bit(
-            REP_ZERO_FAIL_BIT,
+        prepare_case(
             1'b1
         );
 
 
-        check_target_flag(
+        load_health_debug_data(
+            rep_zero_data
+        );
+
+
+        set_figa_enable(
+            1'b1
+        );
+
+
+        wait_error_flag(
             REP_ZERO_FAIL_BIT,
             "repetition_zero_test_fail"
         );
 
-
-        clear_fail_state();
-
-
-        repeat(2)
-            @(posedge system.sscg_clk);
-
-
-        check_all_error_clear();
-
     endtask
-
 
 
     // ========================================================================
     // CASE 7
     //
-    // RUNTIME ADAPTIVE ERROR
-    //
+    // Runtime adaptive error
     // ========================================================================
 
     virtual task test_adaptive_error();
 
         `uvm_info(
             "TRNG_CASE",
-            "========== CASE 7 : ADAPTIVE ERROR ==========",
+            "CASE 7 : RUNTIME ADAPTATION ERROR",
             UVM_LOW
         )
 
 
-        clear_all_status();
-
-
-        trng_write(
-            TRNG_BYPASS_START_TEST,
-            32'h1
-        );
-
-
-        trng_write(
-            TRNG_HEALTH_DEBUG_MODE,
-            32'h1
-        );
-
-
-        write_sw_trng_data(
-            adaptive_one_data
-        );
-
-
-        trigger_trng();
-
-
-        wait_status_bit(
-            ADAPT_FAIL_BIT,
+        prepare_case(
             1'b1
         );
 
 
-        check_target_flag(
+        load_health_debug_data(
+            adaptive_data
+        );
+
+
+        set_figa_enable(
+            1'b1
+        );
+
+
+        wait_error_flag(
             ADAPT_FAIL_BIT,
             "adaptation_test_fail"
         );
 
 
-        clear_fail_state();
-
-
-        repeat(2)
-            @(posedge system.sscg_clk);
-
-
-        check_all_error_clear();
+        `uvm_info(
+            "TRNG_ADAPT",
+            $sformatf(
+                "adaptation_test_fail_value = %0d",
+                status[18:8]
+            ),
+            UVM_LOW
+        )
 
     endtask
-
 
 
     // ========================================================================
     // CASE 8
     //
-    // CONDITIONING TEST
+    // VPlan:
     //
-    // VPlan：
+    // Use manual mode to test conditioning component works properly.
     //
-    // Use manual mode to test the conditioning component works properly.
+    // 正確 RTL flow：
     //
+    // 1. 正常完成 START_TEST
+    // 2. 進 HEALTH_TEST
+    // 3. health_test_fail == 0
+    // 4. trng_debug_mode == 0
+    // 5. conditioning debug mode = 1
+    // 6. SW_TRNG_DATA 直接成為 trng_data_select
+    // 7. pulse trng_req_sw
+    // 8. conditioning_valid = 1
+    // 9. DRBG conditioning_done
+    // 10. conditioning_finish = 1
     // ========================================================================
 
     virtual task test_conditioning();
 
         `uvm_info(
             "TRNG_CASE",
-            "========== CASE 8 : CONDITIONING ==========",
+            "==================================================",
+            UVM_LOW
+        )
+
+        `uvm_info(
+            "TRNG_CASE",
+            "CASE 8 : CONDITIONING MANUAL TEST",
             UVM_LOW
         )
 
 
-        clear_all_status();
+        // ------------------------------------------------------------
+        // 正常 startup。
+        // ------------------------------------------------------------
 
-        restore_normal_threshold();
-
-
-        // ====================================================================
-        // Step 1
-        //
-        // 先完成 startup health test。
-        //
-        // Register description 明確要求：
-        //
-        // conditioning debug mode 必須在 startup test finish 後才能設定。
-        // ====================================================================
-
-
-        trng_write(
-            TRNG_BYPASS_START_TEST,
-            32'h0
+        prepare_case(
+            1'b0
         );
 
 
-        trng_write(
-            TRNG_HEALTH_DEBUG_MODE,
-            32'h1
-        );
+        // ------------------------------------------------------------
+        // Health path 持續吃 AA。
+        //
+        // 所以後面即使我們把 SW_TRNG_DATA register 改成
+        // conditioning_data，也不會影響 debug_trng_data。
+        //
+        // debug_trng_data 已經在 0->1 pulse 時 capture AA。
+        // ------------------------------------------------------------
 
-
-        trng_write(
-            TRNG_COND_DEBUG_MODE,
-            32'h0
-        );
-
-
-        write_sw_trng_data(
+        load_health_debug_data(
             normal_data
         );
 
 
-        trigger_trng();
-
-
-        wait_status_bit(
-            START_TEST_FINISH_BIT,
+        set_figa_enable(
             1'b1
         );
 
 
-        check_all_error_clear();
+        wait_normal_start_finish();
 
 
-        // ====================================================================
-        // Step 2
+        check_health_error_clear();
+
+
+        // ------------------------------------------------------------
+        // RTL conditioning_finish 要求：
         //
-        // Startup health test 已完成。
+        // !trng_debug_mode
         //
-        // 現在才能 enable conditioning debug mode。
-        // ====================================================================
+        // 所以一定保持 0。
+        // ------------------------------------------------------------
 
         trng_write(
-            TRNG_HEALTH_DEBUG_MODE,
+            TRNG_DEBUG_MODE,
             32'h0
+        );
+
+
+        // ------------------------------------------------------------
+        // Conditioning debug mode：
+        //
+        // RTL 是 combinational mux，
+        // 不需要 0->1 capture pulse。
+        //
+        // trng_data_select =
+        //
+        // cond_debug ? SW_TRNG_DATA : trng_data
+        //
+        // 因此先寫 data 再 enable 即可。
+        // ------------------------------------------------------------
+
+        write_sw_trng_data(
+            conditioning_data
         );
 
 
@@ -1611,174 +1436,215 @@ class mcu_trng_test extends host_base_test;
             32'h1
         );
 
-
-        // --------------------------------------------------------------------
-        // 清掉前一次 conditioning finish
-        // --------------------------------------------------------------------
 
         clear_conditioning_finish();
 
 
-        // --------------------------------------------------------------------
-        // 寫 controlled SW data
-        // --------------------------------------------------------------------
+        repeat(2)
+            @(posedge system.sscg_clk);
 
-        write_sw_trng_data(
-            normal_data
+
+        // ------------------------------------------------------------
+        // 現在已確認 RTL：
+        //
+        // conditioning_valid <=
+        //     trng_req_sw
+        //     && trng_cs == HEALTH_TEST
+        //     && !health_test_fail
+        //     && !trng_debug_mode;
+        //
+        // 所以這個 request 必須等 HEALTH_TEST 後才寫。
+        // ------------------------------------------------------------
+
+        trng_write(
+            TRNG_REQ_SW,
+            32'h1
         );
 
 
-        // --------------------------------------------------------------------
-        // Manual request
-        // --------------------------------------------------------------------
+        // ------------------------------------------------------------
+        // 等 conditioning_finish。
+        // ------------------------------------------------------------
 
-        trigger_trng();
+        wait_conditioning_finish();
 
 
-        // --------------------------------------------------------------------
-        // 等 conditioning finish
-        // --------------------------------------------------------------------
-
-        wait_status_bit(
-            CONDITIONING_FINISH_BIT,
-            1'b1
+        read_conditioning_result(
+            conditioning_result
         );
 
 
-        read_trng_status(
-            status
-        );
+        // ------------------------------------------------------------
+        // Clear behavior。
+        // ------------------------------------------------------------
+
+        clear_conditioning_finish();
 
 
-        if (
-            status[CONDITIONING_FINISH_BIT]
-            !==
-            1'b1
-        ) begin
+        repeat(3)
+            @(posedge system.sscg_clk);
+
+
+        read_status(status);
+
+
+        if (status[COND_FINISH_BIT] !== 1'b0) begin
 
             `uvm_error(
                 "TRNG_CONDITIONING",
-                $sformatf(
-                    "conditioning_finish should be 1, status=0x%08h",
-                    status
-                )
+                "conditioning_finish cannot be cleared"
             )
 
         end
 
 
-        // --------------------------------------------------------------------
-        // Clear conditioning finish
-        // --------------------------------------------------------------------
-
-        clear_conditioning_finish();
-
-
-        // --------------------------------------------------------------------
-        // 確認真的清掉
-        // --------------------------------------------------------------------
-
-        wait_status_bit(
-            CONDITIONING_FINISH_BIT,
-            1'b0
+        trng_write(
+            TRNG_COND_DEBUG_MODE,
+            32'h0
         );
 
 
         `uvm_info(
             "TRNG_CASE",
-            "CASE 8 PASS : Conditioning component works correctly",
+            "CASE 8 PASS",
             UVM_LOW
         )
 
     endtask
 
 
+    // ========================================================================
+    // Wait conditioning finish
+    // ========================================================================
+
+    virtual task wait_conditioning_finish();
+
+        bit done;
+
+        done = 0;
+
+
+        for (int i = 0; i < TRNG_TIMEOUT_CYCLE; i++) begin
+
+            read_status(status);
+
+
+            if (status[COND_FINISH_BIT] === 1'b1) begin
+
+                done = 1;
+
+                break;
+
+            end
+
+
+            // Conditioning 正常執行期間不可以出現 health error。
+            if (status[7:2] !== 6'b0) begin
+
+                print_status(
+                    "COND_HEALTH_FAIL"
+                );
+
+                `uvm_fatal(
+                    "TRNG_CONDITIONING",
+                    "Health test failed while waiting conditioning_finish"
+                )
+
+            end
+
+
+            @(posedge system.sscg_clk);
+
+        end
+
+
+        if (!done) begin
+
+            print_status(
+                "COND_TIMEOUT"
+            );
+
+            `uvm_fatal(
+                "TRNG_TIMEOUT",
+                "Timeout waiting conditioning_finish"
+            )
+
+        end
+
+
+        `uvm_info(
+            "TRNG_CONDITIONING",
+            "conditioning_finish asserted",
+            UVM_LOW
+        )
+
+    endtask
+
 
     // ========================================================================
     // CASE 9
     //
-    // ERROR RECOVERY
+    // Recovery
     //
-    // Error test 全部跑完後重新跑一次正常 health test。
+    // 所有 error injection 後重新 reset，
+    // 再跑一次正常 AA startup。
     //
-    // 確認：
+    // 用來抓：
     //
-    // - fail flag 已清除
-    // - FSM 沒卡住
-    // - request 還能正常接受
-    //
+    // - sticky fail 沒清乾淨
+    // - counter 沒 reset
+    // - FSM 卡住
+    // - debug mode 殘留
     // ========================================================================
 
     virtual task test_recovery();
 
         `uvm_info(
             "TRNG_CASE",
-            "========== CASE 9 : ERROR RECOVERY ==========",
+            "CASE 9 : RECOVERY TEST",
             UVM_LOW
         )
 
 
-        clear_all_status();
-
-        restore_normal_threshold();
-
-
-        trng_write(
-            TRNG_BYPASS_START_TEST,
-            32'h0
+        prepare_case(
+            1'b0
         );
 
 
-        trng_write(
-            TRNG_COND_DEBUG_MODE,
-            32'h0
-        );
-
-
-        trng_write(
-            TRNG_HEALTH_DEBUG_MODE,
-            32'h1
-        );
-
-
-        write_sw_trng_data(
+        load_health_debug_data(
             normal_data
         );
 
 
-        trigger_trng();
-
-
-        wait_status_bit(
-            START_TEST_FINISH_BIT,
+        set_figa_enable(
             1'b1
         );
 
 
-        check_all_error_clear();
+        wait_normal_start_finish();
+
+
+        check_health_error_clear();
 
 
         `uvm_info(
             "TRNG_CASE",
-            "CASE 9 PASS : TRNG recovery successful",
+            "CASE 9 PASS : TRNG recovered successfully",
             UVM_LOW
         )
 
     endtask
 
 
-
     // ========================================================================
-    // RUN PHASE
+    // run_phase
     // ========================================================================
 
     virtual task run_phase(
         uvm_phase phase
     );
 
-        super.run_phase(
-            phase
-        );
+        super.run_phase(phase);
 
 
         phase.raise_objection(
@@ -1794,7 +1660,7 @@ class mcu_trng_test extends host_base_test;
 
         `uvm_info(
             get_type_name(),
-            "TRNG UVM TEST START",
+            "TRNG COMPLETE UVM TEST START",
             UVM_LOW
         )
 
@@ -1805,46 +1671,32 @@ class mcu_trng_test extends host_base_test;
         )
 
 
-        // --------------------------------------------------------------------
-        // 等 reset release
-        //
-        // 這是你原 test 使用的 system reset flow。
-        // --------------------------------------------------------------------
+        // ------------------------------------------------------------
+        // 不用 @(posedge rst_n)，避免進 run_phase 時 reset 已經 high
+        // 導致永遠等不到下一個 posedge。
+        // ------------------------------------------------------------
 
-        @(posedge system.rst_n);
+        wait(
+            system.rst_n === 1'b1
+        );
 
-
-        // --------------------------------------------------------------------
-        // 多等幾個 clock，避免 reset release 當下就 access register。
-        // --------------------------------------------------------------------
 
         repeat(10)
             @(posedge system.sscg_clk);
 
 
-        // --------------------------------------------------------------------
-        // 建立 input pattern
-        // --------------------------------------------------------------------
-
         build_test_pattern();
 
 
-        // --------------------------------------------------------------------
-        // 初始化 TRNG
-        // --------------------------------------------------------------------
-
-        trng_init();
-
-
         // ====================================================================
-        // Normal Health Test
+        // VPlan normal health
         // ====================================================================
 
         test_health_normal();
 
 
         // ====================================================================
-        // Startup Health Test Error
+        // Startup error flags
         // ====================================================================
 
         test_start_rep_one_error();
@@ -1855,7 +1707,7 @@ class mcu_trng_test extends host_base_test;
 
 
         // ====================================================================
-        // Runtime Health Test Error
+        // Runtime health-test error flags
         // ====================================================================
 
         test_rep_one_error();
@@ -1866,14 +1718,14 @@ class mcu_trng_test extends host_base_test;
 
 
         // ====================================================================
-        // Conditioning
+        // VPlan conditioning
         // ====================================================================
 
         test_conditioning();
 
 
         // ====================================================================
-        // Error Recovery
+        // Recovery
         // ====================================================================
 
         test_recovery();
@@ -1887,7 +1739,7 @@ class mcu_trng_test extends host_base_test;
 
         `uvm_info(
             get_type_name(),
-            "TRNG UVM TEST FINISH",
+            "TRNG COMPLETE UVM TEST PASS",
             UVM_LOW
         )
 
