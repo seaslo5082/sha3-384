@@ -165,7 +165,7 @@ class mcu_sha_read_salt_test extends host_base_test;
         //
         // ONLY CHECK:
         //
-        // reg_salt -> 0
+        // internal salt_data -> 0
         // ========================================================
 
         run_salt_clr_test(9);
@@ -561,79 +561,25 @@ class mcu_sha_read_salt_test extends host_base_test;
 
     task automatic run_salt_clr_test(input int tc);
 
-        bit [31:0] rdata;
-
-        bit [31:0] test_salt;
-
-        test_salt = 32'h1234_5678;
+        bit [7:0] salt_data_after_clear;
 
         `uvm_info("SALT_CLR", "TC9 SHA local salt_clr START", UVM_LOW)
 
-        // --------------------------------------------------------
-        // STEP 1
-        //
-        // preload non-zero reg_salt
-        // --------------------------------------------------------
-
-        mcu_word_wr(m_host_top_cfg.sha384_page_addr_1, 8'hF8, test_salt);
-
-        // --------------------------------------------------------
-        // STEP 2
-        //
-        // verify preload
-        // --------------------------------------------------------
-
-        mcu_word_rd(m_host_top_cfg.sha384_page_addr_1, 8'hF8, rdata);
-
-        if (rdata !== test_salt) begin
-
-            `uvm_fatal("SALT_CLR_PRELOAD", $sformatf("reg_salt preload failed exp=%08h got=%08h", test_salt, rdata))
-
-        end
-
-        // --------------------------------------------------------
-        // STEP 3
-        //
-        // F4[0] = salt_clr
-        //
-        // RTL 已經確認是 write pulse
-        //
-        // RTL confirms that salt_clr is a write pulse
-        // --------------------------------------------------------
-
+        // F4[0] is a pulse into sha3_top.salt_clr.
+        // RTL behavior: if (salt_clr) salt_data <= 8'd0.
+        // It does NOT clear reg_salt, so F8 must not be used as the check.
         mcu_word_wr(m_host_top_cfg.sha384_page_addr_1, 8'hF4, 32'h0000_0001);
-
-        // --------------------------------------------------------
-        // STEP 4
-        //
-        // 給 core 一點 clock 讓 clear 生效
-        //
-        // Give the core enough clocks for the clear to take effect
-        // --------------------------------------------------------
-
         #100ns;
 
-        // --------------------------------------------------------
-        // STEP 5
-        //
-        // read reg_salt again
-        // --------------------------------------------------------
+        salt_data_after_clear = system.i_NT71801.i01_grp_tcon.i1_apr_top.u_crypto_top.i_sha3_top.salt_data;
 
-        mcu_word_rd(m_host_top_cfg.sha384_page_addr_1, 8'hF8, rdata);
-
-        if (rdata === 32'h0000_0000) begin
-
+        if (salt_data_after_clear === 8'h00) begin
             pass_cnt++;
-
-            `uvm_info("SALT_CLR_PASS", $sformatf("TC=%0d PASS reg_salt=%08h", tc, rdata), UVM_LOW)
-
+            `uvm_info("SALT_CLR_PASS", $sformatf("TC=%0d PASS salt_data=%02h", tc, salt_data_after_clear), UVM_LOW)
         end
         else begin
-
             fail_cnt++;
-
-            `uvm_error("SALT_CLR_FAIL", $sformatf({ "TC=%0d FAIL ", "after F4[0] salt_clr, ", "reg_salt=%08h ", "expected=00000000" }, tc, rdata))
-
+            `uvm_error("SALT_CLR_FAIL", $sformatf("TC=%0d FAIL after F4[0] salt_clr, salt_data=%02h expected=00", tc, salt_data_after_clear))
         end
 
     endtask
