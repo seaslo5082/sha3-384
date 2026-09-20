@@ -1,0 +1,435 @@
+class mcu_rw_ctrl_status_and_soft_rst_test extends host_base_test;
+
+    `uvm_component_utils(mcu_rw_ctrl_status_and_soft_rst_test)
+
+    // ------------------------------------------------------------
+    // Addresses that must NOT be randomly written
+    // ------------------------------------------------------------
+    logic [31:0] no_wr_addr[$];
+
+    // ------------------------------------------------------------
+    // Save MCU_CTRL values written BEFORE soft reset.
+    // These queues are used for retention checking AFTER soft reset.
+    // ------------------------------------------------------------
+    logic [31:0] retention_addr[$];
+    logic [7:0]  retention_data[$];
+
+
+    // ============================================================
+    // Constructor
+    // ============================================================
+    function new(
+        string name = "mcu_rw_ctrl_status_and_soft_rst_test",
+        uvm_component parent
+    );
+        super.new(name, parent);
+    endfunction : new
+
+
+    // ============================================================
+    // Build Phase
+    // ============================================================
+    function void build_phase(uvm_phase phase);
+
+        super.build_phase(phase);
+
+        `uvm_info(
+            get_type_name(),
+            "mcu_rw_ctrl_status_and_soft_rst_test build_phase START",
+            UVM_LOW
+        )
+
+    endfunction : build_phase
+
+
+    // ============================================================
+    // Write MCU_CTRL before SOFT RESET
+    //
+    // Flow:
+    //
+    // Random address
+    //      |
+    // Random data
+    //      |
+    // WRITE
+    //      |
+    // READ + COMPARE
+    //      |
+    // Save addr/data
+    //
+    // IMPORTANT:
+    // retention_addr / retention_data preserve the value that
+    // should survive SOFT RESET.
+    // ============================================================
+    virtual task mcu_ctrl_write_and_save(
+        input logic [31:0] start_addr,
+        input logic [31:0] end_addr,
+        input int          length,
+        input logic [31:0] no_wr_addr[] = '{} 
+    );
+
+        logic [31:0] test_addr;
+        logic [7:0]  test_data;
+
+        retention_addr.delete();
+        retention_data.delete();
+
+
+        `uvm_info(
+            get_type_name(),
+            $sformatf(
+                "MCU_CTRL WRITE/SAVE START: start=0x%08h end=0x%08h length=%0d",
+                start_addr,
+                end_addr,
+                length
+            ),
+            UVM_LOW
+        )
+
+
+        for (int i = 0; i < length; i++) begin
+
+            // ----------------------------------------------------
+            // Randomly choose an address.
+            //
+            // Avoid addresses listed in no_wr_addr.
+            // GLOBAL_SOFT_RESET (0x6E) must NOT be randomly hit.
+            // ----------------------------------------------------
+            if (!std::randomize(test_addr) with {
+
+                test_addr inside {[start_addr:end_addr]};
+
+                !(test_addr inside {no_wr_addr});
+
+            }) begin
+
+                `uvm_fatal(
+                    get_type_name(),
+                    "Failed to randomize MCU_CTRL test address"
+                )
+
+            end
+
+
+            // ----------------------------------------------------
+            // Generate random write data
+            // ----------------------------------------------------
+            test_data = $urandom_range(8'h00, 8'hFF);
+
+
+            `uvm_info(
+                get_type_name(),
+                $sformatf(
+                    "MCU_CTRL PRE-RESET [%0d/%0d] addr=0x%08h data=0x%02h",
+                    i + 1,
+                    length,
+                    test_addr,
+                    test_data
+                ),
+                UVM_LOW
+            )
+
+
+            // ----------------------------------------------------
+            // Existing host_base_test task
+            //
+            // WRITE test_data
+            //       +
+            // READ it back
+            //       +
+            // compare
+            //
+            // This proves the register is writable BEFORE reset.
+            // ----------------------------------------------------
+            mcu_read_after_write_data(
+                test_addr,
+                test_data
+            );
+
+
+            // ----------------------------------------------------
+            // Save PRE-RESET expected value.
+            //
+            // IMPORTANT:
+            // After SOFT RESET we will NOT write this register again.
+            // ----------------------------------------------------
+            retention_addr.push_back(test_addr);
+            retention_data.push_back(test_data);
+
+
+            #100ns;
+
+        end
+
+
+        `uvm_info(
+            get_type_name(),
+            $sformatf(
+                "MCU_CTRL WRITE/SAVE END: saved %0d entries",
+                retention_addr.size()
+            ),
+            UVM_LOW
+        )
+
+    endtask : mcu_ctrl_write_and_save
+
+
+
+    // ============================================================
+    // MCU_CTRL SOFT RESET RETENTION CHECK
+    //
+    // !!! READ ONLY !!!
+    //
+    // DO NOT WRITE anything here.
+    //
+    // Flow:
+    //
+    // Saved address
+    //      |
+    // READ DUT
+    //      |
+    // Compare against PRE-RESET data
+    //
+    // Expected:
+    //
+    //     data_after_soft_reset == data_before_soft_reset
+    //
+    // ============================================================
+    virtual task mcu_ctrl_retention_check();
+
+        `uvm_info(
+            get_type_name(),
+            $sformatf(
+                "MCU_CTRL RETENTION CHECK START: entries=%0d",
+                retention_addr.size()
+            ),
+            UVM_LOW
+        )
+
+
+        // --------------------------------------------------------
+        // Safety check
+        // --------------------------------------------------------
+        if (retention_addr.size() != retention_data.size()) begin
+
+            `uvm_fatal(
+                get_type_name(),
+                $sformatf(
+                    "Retention queue size mismatch: addr=%0d data=%0d",
+                    retention_addr.size(),
+                    retention_data.size()
+                )
+            )
+
+        end
+
+
+        // --------------------------------------------------------
+        // Read ONLY.
+        //
+        // No mcu_reg_wr()
+        // No mcu_read_after_write_data()
+        // --------------------------------------------------------
+        foreach (retention_addr[i]) begin
+
+            `uvm_info(
+                get_type_name(),
+                $sformatf(
+                    "MCU_CTRL POST-RESET [%0d] READ ONLY addr=0x%08h expected=0x%02h",
+                    i,
+                    retention_addr[i],
+                    retention_data[i]
+                ),
+                UVM_LOW
+            )
+
+
+            // ----------------------------------------------------
+            // Your mcu_read_data_compare() obtains golden data
+            // from m_reg_model.rom[].
+            //
+            // Therefore explicitly update the golden model with
+            // the PRE-RESET expected value before comparison.
+            //
+            // DUT IS NOT WRITTEN HERE.
+            // ----------------------------------------------------
+            m_reg_model.rom[retention_addr[i]]
+                = retention_data[i];
+
+
+            // ----------------------------------------------------
+            // READ DUT + compare against golden model
+            //
+            // data_length = 1 byte
+            // ----------------------------------------------------
+            mcu_read_data_compare(
+                retention_addr[i],
+                1
+            );
+
+        end
+
+
+        `uvm_info(
+            get_type_name(),
+            "MCU_CTRL RETENTION CHECK END",
+            UVM_LOW
+        )
+
+    endtask : mcu_ctrl_retention_check
+
+
+
+    // ============================================================
+    // Run Phase
+    // ============================================================
+    task run_phase(uvm_phase phase);
+
+        super.run_phase(phase);
+
+        phase.raise_objection(
+            this,
+            "Starting mcu_rw_ctrl_status_and_soft_rst_test"
+        );
+
+
+        // ========================================================
+        // STEP 0
+        // MCU test initialization
+        // ========================================================
+        mcu_test_preset();
+
+        #100ns;
+
+
+        // ========================================================
+        // STEP 1
+        // Exclude GLOBAL_SOFT_RESET register.
+        //
+        // Offset 0x6E = GLOBAL_SOFT_RESET
+        //
+        // We must not accidentally trigger reset during the
+        // random register test.
+        // ========================================================
+        no_wr_addr.delete();
+
+        no_wr_addr.push_back({
+            m_host_top_cfg.mcu_ctrl_status_page_addr,
+            8'h6E
+        });
+
+
+        // ========================================================
+        // STEP 2
+        // PRE-SOFT-RESET MCU_CTRL test
+        //
+        // WRITE
+        //   |
+        // READ / COMPARE
+        //   |
+        // SAVE addr + expected data
+        //
+        // NOTE:
+        // Your original test used 0x00 ~ 0xFF.
+        // Keep this range here only if all writable addresses
+        // in this range are valid for this test.
+        // ========================================================
+        mcu_ctrl_write_and_save(
+            {
+                m_host_top_cfg.mcu_ctrl_status_page_addr,
+                8'h00
+            },
+
+            {
+                m_host_top_cfg.mcu_ctrl_status_page_addr,
+                8'hFF
+            },
+
+            $urandom_range(10, 100),
+
+            no_wr_addr
+        );
+
+
+        // ========================================================
+        // STEP 3
+        // Trigger GLOBAL SOFT RESET
+        // ========================================================
+
+        `uvm_info(
+            get_type_name(),
+            "Trigger GLOBAL SOFT RESET",
+            UVM_LOW
+        )
+
+        perform_soft_reset();
+
+
+        // Give DUT enough time to finish reset.
+        #100ns;
+
+
+        // ========================================================
+        // STEP 4
+        // POST-SOFT-RESET MCU_CTRL RETENTION CHECK
+        //
+        // IMPORTANT:
+        //
+        //                 READ ONLY
+        //
+        // There is NO second write here.
+        //
+        // Expected:
+        //
+        // PRE RESET                       POST RESET
+        //
+        // WRITE A5
+        //    |
+        // READ = A5
+        //    |
+        // SOFT RESET
+        //    |
+        //    +--------------------------> READ = A5
+        //
+        // ========================================================
+        mcu_ctrl_retention_check();
+
+
+        // ========================================================
+        // STEP 5
+        // MCU_STATUS should return to DEFAULT after SOFT RESET.
+        //
+        // IMPORTANT:
+        // Use your register model's expected/default value here.
+        //
+        // Your mcu_read_data_compare() reads golden data from
+        // m_reg_model.rom[].
+        // ========================================================
+
+        `uvm_info(
+            get_type_name(),
+            "Check MCU_STATUS default value after SOFT RESET",
+            UVM_LOW
+        )
+
+        mcu_read_data_compare(
+            {
+                m_host_top_cfg.mcu_ctrl_status_page_addr,
+                8'hFF
+            },
+            1
+        );
+
+
+        // ========================================================
+        // TEST END
+        // ========================================================
+        phase.drop_objection(
+            this,
+            "Finished mcu_rw_ctrl_status_and_soft_rst_test"
+        );
+
+    endtask : run_phase
+
+
+endclass : mcu_rw_ctrl_status_and_soft_rst_test
