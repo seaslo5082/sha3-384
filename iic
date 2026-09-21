@@ -1,0 +1,1046 @@
+class i2c_rw_tcon_page_access_block_and_lock_test
+    extends host_i2c_base_test;
+
+    `uvm_component_utils(i2c_rw_tcon_page_access_block_and_lock_test)
+
+
+    //============================================================
+    // Variables
+    //============================================================
+
+    // Multiple I2C allow-list entries
+    address_list_entry entry_array[];
+
+    // Number of configured allow-list entries
+    int num_entries;
+
+    // General test address
+    logic [31:0] test_addr;
+
+    // Used by lock test
+    logic [31:0] lock_addr;
+    logic [31:0] protected_addr[$];
+
+    // Existing type used by generic W1S lock checker
+    address_list_field_entry lock_field_entry_arr[];
+
+
+    //============================================================
+    // Constructor
+    //============================================================
+
+    function new(
+        string name = "i2c_rw_tcon_page_access_block_and_lock_test",
+        uvm_component parent = null
+    );
+        super.new(name, parent);
+    endfunction
+
+
+    //============================================================
+    // build_phase
+    //============================================================
+
+    function void build_phase(uvm_phase phase);
+        super.build_phase(phase);
+    endfunction
+
+
+    //============================================================
+    // connect_phase
+    //============================================================
+
+    virtual function void connect_phase(uvm_phase phase);
+        super.connect_phase(phase);
+    endfunction
+
+
+    //============================================================
+    // is_in_allow_list()
+    //
+    // [NEW]
+    //
+    // Purpose:
+    //   Determine whether an address belongs to ANY configured
+    //   I2C allow-list entry.
+    //
+    // IMPORTANT:
+    //
+    //   IN  = hit ANY entry
+    //   OUT = hit NONE of the entries
+    //
+    // This avoids the original multi-entry filtering problem.
+    //============================================================
+
+    virtual function bit is_in_allow_list(
+        input logic [31:0]       i_addr,
+        input int                i_num_entries,
+        input address_list_entry i_entry_array[]
+    );
+
+        for (int i = 0; i < i_num_entries; i++) begin
+
+            if ((i_addr >= i_entry_array[i].start_addr) &&
+                (i_addr <= i_entry_array[i].end_addr)) begin
+
+                return 1'b1;
+
+            end
+        end
+
+        return 1'b0;
+
+    endfunction : is_in_allow_list
+
+
+    //============================================================
+    // generate_multi_allow_list_entries()
+    //
+    // [NEW / REPLACE ORIGINAL GENERATOR FOR THIS TEST]
+    //
+    // Purpose:
+    //   Generate MULTIPLE valid I2C allow-list ranges.
+    //
+    // Improvements:
+    //
+    //   1. Check randomize() return value.
+    //   2. Guarantee START <= END.
+    //   3. Verify generated entry is valid.
+    //
+    // NOTE:
+    //   We do NOT require entries to be non-overlapping here.
+    //   The DUT should treat an address as IN if it belongs to
+    //   ANY entry.
+    //
+    //   This is more robust than depending on entry ordering.
+    //============================================================
+
+    virtual task generate_multi_allow_list_entries(
+        input  int                i_num_entries,
+        input  logic [31:0]       i_start_addr,
+        input  logic [31:0]       i_end_addr,
+        output address_list_entry o_entry_array[]
+    );
+
+        o_entry_array = new[i_num_entries];
+
+        for (int i = 0; i < i_num_entries; i++) begin
+
+            o_entry_array[i] = new();
+
+            if (!o_entry_array[i].randomize() with {
+
+                start_addr inside {[i_start_addr:i_end_addr]};
+                end_addr   inside {[i_start_addr:i_end_addr]};
+
+                start_addr <= end_addr;
+
+            }) begin
+
+                `uvm_fatal(
+                    get_type_name(),
+                    $sformatf(
+                        "Failed to randomize I2C allow-list entry[%0d]",
+                        i
+                    )
+                )
+
+            end
+
+
+            `uvm_info(
+                get_type_name(),
+                $sformatf(
+                    "ALLOW_LIST[%0d]: START=0x%08h END=0x%08h",
+                    i,
+                    o_entry_array[i].start_addr,
+                    o_entry_array[i].end_addr
+                ),
+                UVM_LOW
+            )
+
+        end
+
+    endtask : generate_multi_allow_list_entries
+
+
+    //============================================================
+    // check_one_in_allow_list_entry()
+    //
+    // [NEW]
+    //
+    // Purpose:
+    //   Verify important addresses INSIDE one allow-list entry.
+    //
+    // Checked addresses:
+    //
+    //       START
+    //       MID
+    //       END
+    //
+    // Expected behavior:
+    //
+    //       I2C WRITE -> VALID
+    //       I2C READ  -> VALID
+    //
+    // This is much more useful than sweeping every byte of a
+    // potentially huge address range.
+    //============================================================
+
+    virtual task check_one_in_allow_list_entry(
+        input logic [6:0]        i_slv_dev_addr,
+        input int                i_entry_idx,
+        input address_list_entry i_entry
+    );
+
+        logic [31:0] addr;
+        logic [31:0] mid_addr;
+
+
+        `uvm_info(
+            get_type_name(),
+            $sformatf(
+                "Check IN Entry[%0d]: START=0x%08h END=0x%08h",
+                i_entry_idx,
+                i_entry.start_addr,
+                i_entry.end_addr
+            ),
+            UVM_LOW
+        )
+
+
+        //--------------------------------------------------------
+        // 1. START
+        //--------------------------------------------------------
+
+        addr = i_entry.start_addr;
+
+        `uvm_info(
+            get_type_name(),
+            $sformatf(
+                "Entry[%0d] START check: addr=0x%08h",
+                i_entry_idx,
+                addr
+            ),
+            UVM_LOW
+        )
+
+        i2c_write_valid_check(i_slv_dev_addr, addr);
+        i2c_read_valid_check (i_slv_dev_addr, addr);
+
+
+        //--------------------------------------------------------
+        // 2. MID
+        //--------------------------------------------------------
+
+        if (i_entry.end_addr > i_entry.start_addr) begin
+
+            mid_addr =
+                i_entry.start_addr +
+                ((i_entry.end_addr - i_entry.start_addr) >> 1);
+
+            // Avoid duplicate START/END check
+            if ((mid_addr != i_entry.start_addr) &&
+                (mid_addr != i_entry.end_addr)) begin
+
+                `uvm_info(
+                    get_type_name(),
+                    $sformatf(
+                        "Entry[%0d] MID check: addr=0x%08h",
+                        i_entry_idx,
+                        mid_addr
+                    ),
+                    UVM_LOW
+                )
+
+                i2c_write_valid_check(i_slv_dev_addr, mid_addr);
+                i2c_read_valid_check (i_slv_dev_addr, mid_addr);
+
+            end
+
+        end
+
+
+        //--------------------------------------------------------
+        // 3. END
+        //--------------------------------------------------------
+
+        if (i_entry.end_addr != i_entry.start_addr) begin
+
+            addr = i_entry.end_addr;
+
+            `uvm_info(
+                get_type_name(),
+                $sformatf(
+                    "Entry[%0d] END check: addr=0x%08h",
+                    i_entry_idx,
+                    addr
+                ),
+                UVM_LOW
+            )
+
+            i2c_write_valid_check(i_slv_dev_addr, addr);
+            i2c_read_valid_check (i_slv_dev_addr, addr);
+
+        end
+
+    endtask : check_one_in_allow_list_entry
+
+
+    //============================================================
+    // check_multi_allow_list_boundary()
+    //
+    // [NEW]
+    //
+    // Purpose:
+    //   Check boundaries of EVERY allow-list entry.
+    //
+    // For each entry:
+    //
+    //     START      -> IN
+    //     END        -> IN
+    //
+    //     START - 1  -> OUT, only if it doesn't hit another entry
+    //     END   + 1  -> OUT, only if it doesn't hit another entry
+    //
+    // Expected:
+    //
+    //   IN:
+    //       WRITE VALID
+    //       READ  VALID
+    //
+    //   OUT:
+    //       WRITE BLOCKED
+    //       READ  VALID
+    //
+    // The is_in_allow_list() check is important when multiple
+    // ranges overlap or touch each other.
+    //============================================================
+
+    virtual task check_multi_allow_list_boundary(
+        input logic [6:0]        i_slv_dev_addr,
+        input int                i_num_entries,
+        input address_list_entry i_entry_array[]
+    );
+
+        logic [31:0] addr;
+
+
+        `uvm_info(
+            get_type_name(),
+            "===== MULTI ALLOW-LIST BOUNDARY CHECK START =====",
+            UVM_LOW
+        )
+
+
+        for (int i = 0; i < i_num_entries; i++) begin
+
+
+            //----------------------------------------------------
+            // Check START / MID / END as IN
+            //----------------------------------------------------
+
+            check_one_in_allow_list_entry(
+                i_slv_dev_addr,
+                i,
+                i_entry_array[i]
+            );
+
+
+            //----------------------------------------------------
+            // START - 1
+            //
+            // Do NOT blindly assume this is OUT.
+            //
+            // Example:
+            //
+            // Entry0 = 100 ~ 200
+            // Entry1 = 201 ~ 300
+            //
+            // Entry1.START - 1 = 200
+            // but 200 belongs to Entry0.
+            //----------------------------------------------------
+
+            if (i_entry_array[i].start_addr != 32'h0000_0000) begin
+
+                addr = i_entry_array[i].start_addr - 1;
+
+                if (!is_in_allow_list(
+                        addr,
+                        i_num_entries,
+                        i_entry_array
+                    )) begin
+
+
+                    `uvm_info(
+                        get_type_name(),
+                        $sformatf(
+                            "Entry[%0d] START-1 OUT check: addr=0x%08h",
+                            i,
+                            addr
+                        ),
+                        UVM_LOW
+                    )
+
+
+                    // OUT:
+                    // write blocked / read valid
+                    i2c_write_fail_check(i_slv_dev_addr, addr);
+                    i2c_read_valid_check(i_slv_dev_addr, addr);
+
+                end
+
+            end
+
+
+            //----------------------------------------------------
+            // END + 1
+            //----------------------------------------------------
+
+            if (i_entry_array[i].end_addr != 32'hFFFF_FFFF) begin
+
+                addr = i_entry_array[i].end_addr + 1;
+
+                if (!is_in_allow_list(
+                        addr,
+                        i_num_entries,
+                        i_entry_array
+                    )) begin
+
+
+                    `uvm_info(
+                        get_type_name(),
+                        $sformatf(
+                            "Entry[%0d] END+1 OUT check: addr=0x%08h",
+                            i,
+                            addr
+                        ),
+                        UVM_LOW
+                    )
+
+
+                    // OUT:
+                    // write blocked / read valid
+                    i2c_write_fail_check(i_slv_dev_addr, addr);
+                    i2c_read_valid_check(i_slv_dev_addr, addr);
+
+                end
+
+            end
+
+        end
+
+
+        `uvm_info(
+            get_type_name(),
+            "===== MULTI ALLOW-LIST BOUNDARY CHECK END =====",
+            UVM_LOW
+        )
+
+    endtask : check_multi_allow_list_boundary
+
+
+    //============================================================
+    // verify_multi_allow_list_lock()
+    //
+    // [NEW]
+    //
+    // Purpose:
+    //
+    //   After I2C_ALLOW_LIST_LOCK = 1:
+    //
+    //       NUM_ENTRIES cannot change
+    //       Entry0 START/END cannot change
+    //       Entry1 START/END cannot change
+    //       ...
+    //       EntryN START/END cannot change
+    //
+    //       LOCK itself is W1S:
+    //       LOCK = 1 cannot be cleared back to 0.
+    //
+    // This wraps your EXISTING generic helper:
+    //
+    //   mcu_rw_and_rw_after_lock_and_lock_w1s_check()
+    //
+    // so run_phase does not need to know all register details.
+    //============================================================
+
+    virtual task verify_multi_allow_list_lock(
+        input int i_num_entries
+    );
+
+        logic [31:0] entry_start_addr;
+        logic [31:0] entry_end_addr;
+
+
+        protected_addr.delete();
+
+
+        `uvm_info(
+            get_type_name(),
+            "===== MULTI ALLOW-LIST LOCK CHECK START =====",
+            UVM_LOW
+        )
+
+
+        //--------------------------------------------------------
+        // I2C_ALLOW_LIST_LOCK
+        //
+        // Keep the same address mapping used by your original
+        // test:
+        //
+        //     page_addr_1 + 0x48
+        //--------------------------------------------------------
+
+        lock_addr = {
+            m_host_top_cfg.access_blocking_page_addr_1,
+            8'h48
+        };
+
+
+        //--------------------------------------------------------
+        // I2C_ALLOW_LIST_NUM_ENTRIES
+        //
+        // Original register mapping:
+        //
+        //     page_addr_1 + 0x4C
+        //--------------------------------------------------------
+
+        protected_addr.push_back(
+            {
+                m_host_top_cfg.access_blocking_page_addr_1,
+                8'h4C
+            }
+        );
+
+
+        //--------------------------------------------------------
+        // Every configured START / END register
+        //
+        // According to your existing code:
+        //
+        // Entry0 START = 0x50 ~ 0x53
+        // Entry0 END   = 0x54 ~ 0x57
+        //
+        // Entry1 START = 0x58 ~ 0x5B
+        // Entry1 END   = 0x5C ~ 0x5F
+        //
+        // stride = 8 bytes / entry
+        //--------------------------------------------------------
+
+        for (int i = 0; i < i_num_entries; i++) begin
+
+            entry_start_addr =
+                {
+                    m_host_top_cfg.access_blocking_page_addr_1,
+                    8'h50
+                } + (i * 8);
+
+            entry_end_addr =
+                {
+                    m_host_top_cfg.access_blocking_page_addr_1,
+                    8'h54
+                } + (i * 8);
+
+
+            //----------------------------------------------------
+            // START[31:0] -> four byte addresses
+            //----------------------------------------------------
+
+            for (int b = 0; b < 4; b++) begin
+
+                protected_addr.push_back(
+                    entry_start_addr + b
+                );
+
+            end
+
+
+            //----------------------------------------------------
+            // END[31:0] -> four byte addresses
+            //----------------------------------------------------
+
+            for (int b = 0; b < 4; b++) begin
+
+                protected_addr.push_back(
+                    entry_end_addr + b
+                );
+
+            end
+
+        end
+
+
+        //--------------------------------------------------------
+        // LOCK field
+        //
+        // Keep the same lock-field mechanism used by your
+        // original test.
+        //--------------------------------------------------------
+
+        lock_field_entry_arr = new[1];
+
+        lock_field_entry_arr[0] = new();
+
+        lock_field_entry_arr[0].field =
+            m_host_top_cfg.access_blocking_page_addr_1;
+
+        lock_field_entry_arr[0].bits = '{0};
+
+
+        `uvm_info(
+            get_type_name(),
+            $sformatf(
+                "LOCK=0x%08h, protected register bytes=%0d",
+                lock_addr,
+                protected_addr.size()
+            ),
+            UVM_LOW
+        )
+
+
+        //--------------------------------------------------------
+        // Existing generic lock checker
+        //
+        // Expected behavior:
+        //
+        // 1. Write LOCK = 1
+        //
+        // 2. Try changing protected registers
+        //
+        // 3. Read back and verify they did NOT change
+        //
+        // 4. Try clearing LOCK
+        //
+        // 5. Verify LOCK remains 1 (W1S)
+        //--------------------------------------------------------
+
+        mcu_rw_and_rw_after_lock_and_lock_w1s_check(
+            lock_addr,
+            protected_addr,
+            lock_field_entry_arr
+        );
+
+
+        `uvm_info(
+            get_type_name(),
+            $sformatf(
+                "MULTI ALLOW-LIST LOCK CHECK PASS, entries=%0d",
+                i_num_entries
+            ),
+            UVM_LOW
+        )
+
+
+    endtask : verify_multi_allow_list_lock
+
+
+    //============================================================
+    //
+    // RUN PHASE
+    //
+    // The run_phase intentionally contains only the verification
+    // SCENARIO.
+    //
+    // Implementation details are moved into helper tasks.
+    //
+    //============================================================
+
+    task run_phase(uvm_phase phase);
+
+
+        super.run_phase(phase);
+
+        phase.raise_objection(this);
+
+
+        //--------------------------------------------------------
+        // Initial setup
+        //--------------------------------------------------------
+
+        mcu_test_preset();
+
+        #100ns;
+
+
+        //========================================================
+        //
+        // PHASE 1
+        //
+        // Default:
+        //
+        //     I2C_ALLOW_LIST_EN = 0
+        //
+        // Expected:
+        //
+        //     I2C WRITE -> BLOCK
+        //     I2C READ  -> VALID
+        //
+        // This verifies the default access-blocking behavior.
+        //
+        //========================================================
+
+        `uvm_info(
+            get_type_name(),
+            "===== PHASE 1: DEFAULT ALLOW-LIST DISABLED =====",
+            UVM_LOW
+        )
+
+
+        if (amba_to_reg_set.addr.size() == 0) begin
+
+            `uvm_fatal(
+                get_type_name(),
+                "amba_to_reg_set.addr is empty"
+            )
+
+        end
+
+
+        test_addr = amba_to_reg_set.addr[0];
+
+
+        // Write must be blocked
+        i2c_write_fail_check(
+            slv_dev_addr,
+            test_addr
+        );
+
+
+        // Read must still be valid
+        i2c_read_valid_check(
+            slv_dev_addr,
+            test_addr
+        );
+
+
+        //========================================================
+        //
+        // PHASE 2
+        //
+        // Configure MULTIPLE I2C allow-list entries.
+        //
+        // [MODIFIED]
+        //
+        // Original:
+        //     num_entries = $urandom_range(20,32)
+        //
+        // New:
+        //     4 ~ 8 entries
+        //
+        // Reason:
+        //     This test verifies MULTI-entry functionality rather
+        //     than maximum-entry stress.
+        //
+        //     Max 32-entry stress can be a separate test.
+        //
+        //========================================================
+
+        `uvm_info(
+            get_type_name(),
+            "===== PHASE 2: CONFIGURE MULTIPLE ALLOW-LIST ENTRIES =====",
+            UVM_LOW
+        )
+
+
+        num_entries = $urandom_range(4, 8);
+
+
+        `uvm_info(
+            get_type_name(),
+            $sformatf(
+                "Number of I2C allow-list entries = %0d",
+                num_entries
+            ),
+            UVM_LOW
+        )
+
+
+        //--------------------------------------------------------
+        // Generate valid multiple allow-list entries
+        //--------------------------------------------------------
+
+        generate_multi_allow_list_entries(
+            num_entries,
+            m_host_top_cfg.tcon_reg_addr_st,
+            m_host_top_cfg.tcon_reg_addr_ed,
+            entry_array
+        );
+
+
+        //--------------------------------------------------------
+        // Program:
+        //
+        // I2C_ALLOW_LIST_NUM_ENTRIES
+        // I2C_ALLOW_LIST_START[n]
+        // I2C_ALLOW_LIST_END[n]
+        //
+        // using your existing base-test helper.
+        //--------------------------------------------------------
+
+        i2c_allow_list_config(
+            num_entries,
+            entry_array
+        );
+
+
+        //========================================================
+        //
+        // PHASE 3
+        //
+        // Check address INSIDE every configured allow-list entry.
+        //
+        // For EACH entry:
+        //
+        //     START -> WR valid / RD valid
+        //     MID   -> WR valid / RD valid
+        //     END   -> WR valid / RD valid
+        //
+        // [MODIFIED]
+        //
+        // No longer sweep every address in the entire range.
+        //
+        //========================================================
+
+        `uvm_info(
+            get_type_name(),
+            "===== PHASE 3: CHECK ADDRESS INSIDE EVERY ALLOW-LIST =====",
+            UVM_LOW
+        )
+
+
+        for (int i = 0; i < num_entries; i++) begin
+
+            check_one_in_allow_list_entry(
+                slv_dev_addr,
+                i,
+                entry_array[i]
+            );
+
+        end
+
+
+        //========================================================
+        //
+        // PHASE 4
+        //
+        // MULTIPLE allow-list boundary + OUTSIDE check.
+        //
+        // For every entry:
+        //
+        //     START     -> IN
+        //     MID       -> IN
+        //     END       -> IN
+        //
+        //     START - 1 -> OUT, if not inside another entry
+        //     END   + 1 -> OUT, if not inside another entry
+        //
+        // OUT expected:
+        //
+        //     WRITE -> BLOCK
+        //     READ  -> VALID
+        //
+        // Then use the existing general OUT checker to test
+        // additional addresses outside ALL configured entries.
+        //
+        //========================================================
+
+        `uvm_info(
+            get_type_name(),
+            "===== PHASE 4: MULTI ALLOW-LIST BOUNDARY / OUT CHECK =====",
+            UVM_LOW
+        )
+
+
+        //--------------------------------------------------------
+        // Explicit boundary check
+        //--------------------------------------------------------
+
+        check_multi_allow_list_boundary(
+            slv_dev_addr,
+            num_entries,
+            entry_array
+        );
+
+
+        //--------------------------------------------------------
+        // General OUT check
+        //
+        // IMPORTANT:
+        // filter_addr_by_allow_list() in host_i2c_base_test must
+        // use the corrected "hit ANY / hit NONE" implementation
+        // shown below this class.
+        //--------------------------------------------------------
+
+        i2c_out_allow_list_check(
+            slv_dev_addr,
+            amba_to_reg_set.addr,
+            num_entries,
+            entry_array
+        );
+
+
+        //========================================================
+        //
+        // PHASE 5
+        //
+        // Lock MULTIPLE I2C allow-list entries.
+        //
+        // Verify:
+        //
+        //     I2C_ALLOW_LIST_NUM_ENTRIES cannot change
+        //
+        //     ALL configured START[n] cannot change
+        //
+        //     ALL configured END[n] cannot change
+        //
+        //     I2C_ALLOW_LIST_LOCK:
+        //         1 -> 0 is not allowed
+        //
+        //========================================================
+
+        `uvm_info(
+            get_type_name(),
+            "===== PHASE 5: MULTI ALLOW-LIST LOCK CHECK =====",
+            UVM_LOW
+        )
+
+
+        verify_multi_allow_list_lock(
+            num_entries
+        );
+
+
+        //========================================================
+        //
+        // TEST COMPLETE
+        //
+        //========================================================
+
+        `uvm_info(
+            get_type_name(),
+            "===== I2C TCON PAGE ACCESS BLOCKING / MULTI ALLOW-LIST TEST PASSED =====",
+            UVM_LOW
+        )
+
+
+        phase.drop_objection(this);
+
+
+    endtask : run_phase
+
+
+endclass :
+    i2c_rw_tcon_page_access_block_and_lock_test
+
+
+//============================================================
+// filter_addr_by_allow_list
+//
+// [MODIFIED]
+//
+// IN:
+//   Address belongs to ANY configured entry.
+//
+// OUT:
+//   Address belongs to NONE of the configured entries.
+//============================================================
+virtual task filter_addr_by_allow_list(
+    input  int                i_num_entries,
+    input  address_list_entry i_entry_array[],
+    input  logic [31:0]       i_addr_array[],
+    output logic [31:0]       o_addr_que[$],
+    input  string             filter_type
+);
+
+    bit addr_is_in;
+
+
+    //------------------------------------------------------------
+    // Always clear output queue first.
+    //------------------------------------------------------------
+    o_addr_que.delete();
+
+
+    //------------------------------------------------------------
+    // Check every candidate address.
+    //------------------------------------------------------------
+    foreach (i_addr_array[j]) begin
+
+        addr_is_in = is_in_allow_list(
+            i_addr_array[j],
+            i_num_entries,
+            i_entry_array
+        );
+
+
+        //--------------------------------------------------------
+        // IN = hit ANY allow-list entry
+        //--------------------------------------------------------
+        if (filter_type == "IN") begin
+
+            if (addr_is_in)
+                o_addr_que.push_back(i_addr_array[j]);
+
+        end
+
+
+        //--------------------------------------------------------
+        // OUT = hit NONE of the allow-list entries
+        //--------------------------------------------------------
+        else if (filter_type == "OUT") begin
+
+            if (!addr_is_in)
+                o_addr_que.push_back(i_addr_array[j]);
+
+        end
+
+
+        //--------------------------------------------------------
+        // Invalid argument
+        //--------------------------------------------------------
+        else begin
+
+            `uvm_fatal(
+                get_type_name(),
+                $sformatf(
+                    "Invalid filter_type = %s, expected IN or OUT",
+                    filter_type
+                )
+            )
+
+        end
+
+    end
+
+
+    //------------------------------------------------------------
+    // Avoid silent PASS.
+    //
+    // If no address was selected, something is wrong with either
+    // the test configuration or candidate address pool.
+    //------------------------------------------------------------
+    if (o_addr_que.size() == 0) begin
+
+        `uvm_fatal(
+            get_type_name(),
+            $sformatf(
+                "No address found for filter_type = %s",
+                filter_type
+            )
+        )
+
+    end
+
+
+    `uvm_info(
+        get_type_name(),
+        $sformatf(
+            "filter_addr_by_allow_list: type=%s, selected=%0d",
+            filter_type,
+            o_addr_que.size()
+        ),
+        UVM_LOW
+    )
+
+endtask : filter_addr_by_allow_list
