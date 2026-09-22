@@ -1,0 +1,1297 @@
+class i2c_over_spi_access_block_test extends host_i2c_over_spi_base_test;
+
+    `uvm_component_utils(i2c_over_spi_access_block_test)
+
+    // ============================================================
+    // Original random setting object
+    //
+    // reg_set:
+    //   Used to generate:
+    //     1. flash_start_addr
+    //     2. data_word
+    //     3. random program data[]
+    // ============================================================
+    tcon_reg_setting_i2c_over_spi reg_set;
+
+
+    // ============================================================
+    // NVM partition configuration
+    //
+    // nvm_prot_en[3:0]:
+    //   Each bit controls whether PART0 ~ PART3 is protected.
+    //
+    // nvm_part_start[0]:
+    //   boundary between PART0 / PART1
+    //
+    // nvm_part_start[1]:
+    //   boundary between PART1 / PART2
+    //
+    // nvm_part_start[2]:
+    //   boundary between PART2 / PART3
+    //
+    // PART_START is 20-bit and represents address[31:12].
+    // Therefore the real byte boundary is:
+    //
+    //   {nvm_part_start[x], 12'h000}
+    //
+    // ============================================================
+    rand logic [3:0]  nvm_prot_en;
+    rand logic [19:0] nvm_part_start[3];
+
+
+    // ============================================================
+    // Filtered register-setting queues
+    //
+    // filtered_reg_in:
+    //   Access range is completely inside protected region.
+    //
+    // filtered_reg_out:
+    //   Access range is completely outside protected region.
+    //
+    // Mixed protected/unprotected transactions are intentionally
+    // excluded from these two queues.
+    // ============================================================
+    tcon_reg_setting_i2c_over_spi filtered_reg_in[$];
+    tcon_reg_setting_i2c_over_spi filtered_reg_out[$];
+
+
+    // ============================================================
+    // Constructor
+    // ============================================================
+    function new(
+        string name = "i2c_over_spi_access_block_test",
+        uvm_component parent = null
+    );
+        super.new(name, parent);
+
+        reg_set = new();
+    endfunction
+
+
+    // ============================================================
+    // build_phase
+    // ============================================================
+    virtual function void build_phase(uvm_phase phase);
+        super.build_phase(phase);
+    endfunction
+
+
+    // ============================================================
+    // connect_phase
+    // ============================================================
+    virtual function void connect_phase(uvm_phase phase);
+        super.connect_phase(phase);
+    endfunction
+
+
+    // ============================================================
+    // get_nvm_partition()
+    //
+    // Purpose:
+    //   Convert one BYTE ADDRESS into PART0/PART1/PART2/PART3.
+    //
+    // IMPORTANT:
+    //   PART_START[x] is a 20-bit page number.
+    //   Therefore:
+    //
+    //       real boundary = {PART_START[x], 12'h000}
+    //
+    // Example:
+    //
+    //   PART_START[0] = 20'h00100
+    //
+    //   => boundary = 32'h0010_0000
+    //
+    //
+    // This function replaces duplicated partition-selection code.
+    //
+    // Assumption inherited from the original implementation:
+    //   PART_START[x] == 0 means this boundary is not used.
+    //
+    // ============================================================
+    function automatic int get_nvm_partition(
+        input logic [31:0] addr,
+        input logic [19:0] part_start[3]
+    );
+
+        logic [31:0] boundary[3];
+
+        boundary[0] = {part_start[0], 12'h000};
+        boundary[1] = {part_start[1], 12'h000};
+        boundary[2] = {part_start[2], 12'h000};
+
+
+        // --------------------------------------------------------
+        // PART_START0 exists:
+        //
+        // PART0 : [0, B0)
+        // PART1 : [B0, B1)
+        // PART2 : [B1, B2)
+        // PART3 : [B2, MAX]
+        // --------------------------------------------------------
+        if (part_start[0] != 0) begin
+
+            if (addr < boundary[0])
+                return 0;
+
+            else if ((part_start[1] != 0) &&
+                     (addr < boundary[1]))
+                return 1;
+
+            else if ((part_start[2] != 0) &&
+                     (addr < boundary[2]))
+                return 2;
+
+            else
+                return 3;
+        end
+
+
+        // --------------------------------------------------------
+        // PART_START0 == 0
+        //
+        // Keep the behavior of your original code:
+        // PART0 does not occupy an address range.
+        // --------------------------------------------------------
+        else begin
+
+            if ((part_start[1] != 0) &&
+                (addr < boundary[1]))
+                return 1;
+
+            else if ((part_start[2] != 0) &&
+                     (addr < boundary[2]))
+                return 2;
+
+            else
+                return 3;
+        end
+
+    endfunction : get_nvm_partition
+
+
+    // ============================================================
+    // is_addr_protected()
+    //
+    // Return:
+    //   1 -> address belongs to a protected partition
+    //   0 -> address belongs to an accessible partition
+    //
+    // ============================================================
+    function automatic bit is_addr_protected(
+        input logic [31:0] addr,
+        input logic [3:0]  prot_en,
+        input logic [19:0] part_start[3]
+    );
+
+        int partition_num;
+
+        partition_num = get_nvm_partition(addr, part_start);
+
+        return prot_en[partition_num];
+
+    endfunction : is_addr_protected
+
+
+    // ============================================================
+    // filter_addr_by_nvm_partition()
+    //
+    // IMPORTANT FIX:
+    //
+    // Original code used:
+    //
+    //     addr += 4
+    //
+    // But data_word is BYTE COUNT in this environment.
+    //
+    // For example:
+    //
+    //     data_word = 16
+    //
+    // means:
+    //
+    //     start_addr
+    //     start_addr + 1
+    //     ...
+    //     start_addr + 15
+    //
+    // Therefore this version checks EVERY BYTE.
+    //
+    //
+    // filter_type:
+    //
+    //   "IN"
+    //      Entire transaction must be protected.
+    //
+    //   "OUT"
+    //      Entire transaction must be unprotected.
+    //
+    //
+    // Mixed transaction:
+    //
+    //   protected + unprotected bytes
+    //
+    // will NOT be returned by either IN or OUT.
+    //
+    // ============================================================
+    virtual task filter_addr_by_nvm_partition(
+        input  logic [3:0]  i_nvm_prot_en,
+        input  logic [19:0] i_nvm_part_start[3],
+        input  tcon_reg_setting_i2c_over_spi i_reg_set,
+        output tcon_reg_setting_i2c_over_spi o_reg_queue[$],
+        input  string filter_type
+    );
+
+        tcon_reg_setting_i2c_over_spi reg_item;
+
+        logic [31:0] start_addr;
+        logic [31:0] end_addr;
+        logic [31:0] addr;
+
+        bit all_in_protected;
+        bit all_not_in_protected;
+        bit protected;
+
+        int partition_num;
+
+
+        // Always clear old results.
+        o_reg_queue.delete();
+
+
+        // --------------------------------------------------------
+        // Sanity check
+        // --------------------------------------------------------
+        if (i_reg_set.data_word == 0) begin
+            `uvm_error(
+                get_type_name(),
+                "[NVM FILTER] data_word == 0"
+            )
+            return;
+        end
+
+
+        // --------------------------------------------------------
+        // data_word is BYTE COUNT.
+        //
+        // Example:
+        //
+        // start = 0x100
+        // data_word = 4
+        //
+        // Valid byte range:
+        //
+        // 0x100
+        // 0x101
+        // 0x102
+        // 0x103
+        //
+        // Therefore:
+        //
+        // end = start + data_word - 1
+        // --------------------------------------------------------
+        start_addr = i_reg_set.flash_start_addr;
+
+        end_addr =
+            i_reg_set.flash_start_addr +
+            i_reg_set.data_word -
+            1;
+
+
+        all_in_protected     = 1'b1;
+        all_not_in_protected = 1'b1;
+
+
+        `uvm_info(
+            get_type_name(),
+            $sformatf(
+                "[NVM FILTER] start=0x%08h end=0x%08h bytes=%0d type=%s",
+                start_addr,
+                end_addr,
+                i_reg_set.data_word,
+                filter_type
+            ),
+            UVM_LOW
+        )
+
+
+        // --------------------------------------------------------
+        // FIX:
+        //
+        // Check EVERY BYTE instead of addr += 4.
+        //
+        // This correctly detects transactions crossing an NVM
+        // partition boundary.
+        // --------------------------------------------------------
+        for (addr = start_addr;
+             addr <= end_addr;
+             addr++) begin
+
+            partition_num =
+                get_nvm_partition(
+                    addr,
+                    i_nvm_part_start
+                );
+
+            protected =
+                i_nvm_prot_en[partition_num];
+
+
+            if (!protected)
+                all_in_protected = 1'b0;
+
+            if (protected)
+                all_not_in_protected = 1'b0;
+
+
+            `uvm_info(
+                get_type_name(),
+                $sformatf(
+                    "[NVM FILTER] addr=0x%08h PART%0d protected=%0b",
+                    addr,
+                    partition_num,
+                    protected
+                ),
+                UVM_HIGH
+            )
+
+        end
+
+
+        // --------------------------------------------------------
+        // Mixed range is important information.
+        // --------------------------------------------------------
+        if ((!all_in_protected) &&
+            (!all_not_in_protected)) begin
+
+            `uvm_info(
+                get_type_name(),
+                $sformatf(
+                    "[NVM FILTER] MIXED range 0x%08h ~ 0x%08h",
+                    start_addr,
+                    end_addr
+                ),
+                UVM_LOW
+            )
+
+        end
+
+
+        // --------------------------------------------------------
+        // Generate output item.
+        //
+        // Only flash_start_addr and data_word are required by the
+        // following test flow.
+        // --------------------------------------------------------
+        if (filter_type == "IN") begin
+
+            if (all_in_protected) begin
+
+                reg_item = new();
+
+                reg_item.flash_start_addr =
+                    i_reg_set.flash_start_addr;
+
+                reg_item.data_word =
+                    i_reg_set.data_word;
+
+                o_reg_queue.push_back(reg_item);
+
+
+                `uvm_info(
+                    get_type_name(),
+                    $sformatf(
+                        "[NVM FILTER] ADD IN item addr=0x%06h bytes=%0d",
+                        reg_item.flash_start_addr,
+                        reg_item.data_word
+                    ),
+                    UVM_LOW
+                )
+
+            end
+
+        end
+        else if (filter_type == "OUT") begin
+
+            if (all_not_in_protected) begin
+
+                reg_item = new();
+
+                reg_item.flash_start_addr =
+                    i_reg_set.flash_start_addr;
+
+                reg_item.data_word =
+                    i_reg_set.data_word;
+
+                o_reg_queue.push_back(reg_item);
+
+
+                `uvm_info(
+                    get_type_name(),
+                    $sformatf(
+                        "[NVM FILTER] ADD OUT item addr=0x%06h bytes=%0d",
+                        reg_item.flash_start_addr,
+                        reg_item.data_word
+                    ),
+                    UVM_LOW
+                )
+
+            end
+
+        end
+        else begin
+
+            `uvm_fatal(
+                get_type_name(),
+                $sformatf(
+                    "[NVM FILTER] Illegal filter_type=%s",
+                    filter_type
+                )
+            )
+
+        end
+
+    endtask : filter_addr_by_nvm_partition
+
+
+    // ============================================================
+    // compare_flash_data()
+    //
+    // Generic byte-by-byte comparator.
+    //
+    // This is added because the original OUT test only performed
+    // flash_backdoor_read(), but did not compare the returned data.
+    //
+    // ============================================================
+    virtual task compare_flash_data(
+        input logic [7:0] actual[],
+        input logic [7:0] expected[],
+        input logic [23:0] start_addr,
+        input string check_name
+    );
+
+        if (actual.size() != expected.size()) begin
+
+            `uvm_error(
+                get_type_name(),
+                $sformatf(
+                    "[%s] Size mismatch actual=%0d expected=%0d",
+                    check_name,
+                    actual.size(),
+                    expected.size()
+                )
+            )
+
+            return;
+        end
+
+
+        for (int i = 0; i < expected.size(); i++) begin
+
+            if (actual[i] !== expected[i]) begin
+
+                `uvm_error(
+                    get_type_name(),
+                    $sformatf(
+                        "[%s] MISMATCH addr=0x%06h index=%0d expected=0x%02h actual=0x%02h",
+                        check_name,
+                        start_addr + i,
+                        i,
+                        expected[i],
+                        actual[i]
+                    )
+                )
+
+            end
+
+        end
+
+    endtask : compare_flash_data
+
+
+    // ============================================================
+    // check_flash_all_ff()
+    //
+    // Used after a successful erase.
+    // ============================================================
+    virtual task check_flash_all_ff(
+        input logic [7:0] read_data[],
+        input logic [23:0] start_addr
+    );
+
+        for (int i = 0; i < read_data.size(); i++) begin
+
+            if (read_data[i] !== 8'hFF) begin
+
+                `uvm_error(
+                    get_type_name(),
+                    $sformatf(
+                        "[ERASE CHECK] addr=0x%06h expected=0xFF actual=0x%02h",
+                        start_addr + i,
+                        read_data[i]
+                    )
+                )
+
+            end
+
+        end
+
+    endtask : check_flash_all_ff
+
+
+    // ============================================================
+    // run_phase
+    // ============================================================
+    virtual task run_phase(uvm_phase phase);
+
+        byte data[$];
+
+        logic [7:0] backdoor_read_data[];
+        logic [7:0] golden_data[];
+        logic [7:0] program_expected[];
+
+        tcon_reg_setting_i2c_over_spi reg_item;
+
+        int data_word;
+
+
+        // Preserve parent run_phase behavior.
+        super.run_phase(phase);
+
+        phase.raise_objection(this);
+
+        mcu_test_preset();
+
+
+        // ========================================================
+        // STEP 1
+        //
+        // Enable MCU debug and initialize I2C-over-SPI.
+        //
+        // NVM_PROT_EN is still default = 0 here.
+        //
+        // Expected:
+        //
+        //   Page Program : PASS
+        //   Sector Erase : PASS
+        //   Fast Read    : PASS
+        //
+        // This is the baseline sanity check before enabling
+        // protection.
+        // ========================================================
+
+        `uvm_info(
+            get_type_name(),
+            "===== STEP 1: Baseline test with NVM protection disabled =====",
+            UVM_LOW
+        )
+
+
+        set_eff_mcu_debug_en(1);
+
+        `uvm_info(
+            get_type_name(),
+            "[STEP1] EFF_MCU_DEBUG_EN = 1",
+            UVM_LOW
+        )
+
+
+        i2c_over_spi_test_preset();
+
+        #10us;
+
+
+        // Randomize test data.
+        if (!reg_set.randomize()) begin
+
+            `uvm_fatal(
+                get_type_name(),
+                "[STEP1] reg_set.randomize() failed"
+            )
+
+        end
+
+
+        data       = reg_set.data;
+        data_word  = reg_set.data_word;
+
+
+        // ---------------- Page Program ----------------
+        `uvm_info(
+            get_type_name(),
+            "[STEP1] Page Program - expect VALID",
+            UVM_LOW
+        )
+
+        i2c_over_spi_write_enable();
+
+        #10us;
+
+        i2c_over_spi_page_program(
+            reg_set.flash_start_addr,
+            data,
+            reg_set.data_word,
+            0
+        );
+
+        #100us;
+
+
+        // Existing checker.
+        backdoor_check(
+            reg_set.flash_start_addr,
+            reg_set.data_word
+        );
+
+
+        // ---------------- Sector Erase ----------------
+        `uvm_info(
+            get_type_name(),
+            "[STEP1] Sector Erase - expect VALID",
+            UVM_LOW
+        )
+
+        i2c_over_spi_write_enable();
+
+        #10us;
+
+        i2c_over_spi_sector_erase(
+            reg_set.flash_start_addr,
+            0
+        );
+
+        #300us;
+
+
+        // ---------------- Fast Read ----------------
+        `uvm_info(
+            get_type_name(),
+            "[STEP1] Fast Read - expect VALID",
+            UVM_LOW
+        )
+
+        i2c_over_spi_fast_read(
+            reg_set.flash_start_addr,
+            reg_set.data_word,
+            0
+        );
+
+        #10us;
+
+
+
+        // ========================================================
+        // STEP 2
+        //
+        // Configure NVM partitions.
+        //
+        // IMPORTANT:
+        // Your original code forced:
+        //
+        //     nvm_prot_en = 4'b1111;
+        //
+        // That makes every partition protected and therefore makes
+        // it impossible to obtain a valid OUT region.
+        //
+        // To test both protected and unprotected accesses in ONE
+        // testcase, at least one partition must be protected and
+        // at least one must be accessible.
+        //
+        // Example:
+        //
+        //     4'b0101
+        //
+        // PART0 protected
+        // PART1 accessible
+        // PART2 protected
+        // PART3 accessible
+        //
+        // ========================================================
+
+        `uvm_info(
+            get_type_name(),
+            "===== STEP 2: Configure NVM partition =====",
+            UVM_LOW
+        )
+
+
+        // --------------------------------------------------------
+        // FIX:
+        // Do NOT use 4'b1111 if this testcase wants both IN and OUT.
+        //
+        // Randomize protection bits but require:
+        //
+        //   != 0000 : at least one protected partition
+        //   != 1111 : at least one accessible partition
+        // --------------------------------------------------------
+        if (!std::randomize(nvm_prot_en) with {
+            nvm_prot_en != 4'b0000;
+            nvm_prot_en != 4'b1111;
+        }) begin
+
+            `uvm_fatal(
+                get_type_name(),
+                "[STEP2] Failed to randomize nvm_prot_en"
+            )
+
+        end
+
+
+        // --------------------------------------------------------
+        // Generate ordered partition boundaries.
+        //
+        // Original code randomized each boundary separately.
+        //
+        // That can accidentally create:
+        //
+        //   PART_START0 > PART_START1
+        //
+        // which makes the partition map invalid.
+        //
+        // This version explicitly requires:
+        //
+        //   start0 < start1 < start2
+        //
+        // --------------------------------------------------------
+        if (!std::randomize(nvm_part_start) with {
+
+            nvm_part_start[0] inside {
+                [20'h00001 :
+                 (m_host_top_cfg.spi_flash_addr_max >> 12) - 3]
+            };
+
+            nvm_part_start[1] >
+                nvm_part_start[0];
+
+            nvm_part_start[2] >
+                nvm_part_start[1];
+
+            nvm_part_start[2] <
+                (m_host_top_cfg.spi_flash_addr_max >> 12);
+
+        }) begin
+
+            `uvm_fatal(
+                get_type_name(),
+                "[STEP2] Failed to randomize NVM partition boundaries"
+            )
+
+        end
+
+
+        `uvm_info(
+            get_type_name(),
+            $sformatf(
+                "[STEP2] NVM_PROT_EN = 0x%0h",
+                nvm_prot_en
+            ),
+            UVM_LOW
+        )
+
+
+        for (int i = 0; i < 3; i++) begin
+
+            `uvm_info(
+                get_type_name(),
+                $sformatf(
+                    "[STEP2] PART_START[%0d] = 0x%05h, byte boundary = 0x%08h",
+                    i,
+                    nvm_part_start[i],
+                    {nvm_part_start[i], 12'h000}
+                ),
+                UVM_LOW
+            )
+
+        end
+
+
+        // Apply NVM partition configuration to DUT/model.
+        spi_nvm_partitioning_config(
+            nvm_prot_en,
+            nvm_part_start
+        );
+
+        #10us;
+
+
+
+        // ========================================================
+        // STEP 3
+        //
+        // Find and test one access completely inside a protected
+        // partition.
+        //
+        // Expected:
+        //
+        //   Page Program : BLOCKED
+        //   Sector Erase : BLOCKED
+        //   Fast Read    : VALID
+        //
+        // ========================================================
+
+        `uvm_info(
+            get_type_name(),
+            "===== STEP 3: Protected partition test =====",
+            UVM_LOW
+        )
+
+
+        filtered_reg_in.delete();
+
+
+        // --------------------------------------------------------
+        // Keep randomizing until we find a transaction whose
+        // ENTIRE byte range is protected.
+        //
+        // This avoids the original verification hole where an
+        // empty filtered queue causes STEP3 to do nothing.
+        // --------------------------------------------------------
+        for (int attempt = 0;
+             (attempt < 200) && (filtered_reg_in.size() == 0);
+             attempt++) begin
+
+            if (!reg_set.randomize()) begin
+
+                `uvm_fatal(
+                    get_type_name(),
+                    "[STEP3] reg_set.randomize() failed"
+                )
+
+            end
+
+
+            filter_addr_by_nvm_partition(
+                nvm_prot_en,
+                nvm_part_start,
+                reg_set,
+                filtered_reg_in,
+                "IN"
+            );
+
+        end
+
+
+        if (filtered_reg_in.size() == 0) begin
+
+            `uvm_fatal(
+                get_type_name(),
+                "[STEP3] Cannot find a fully protected transaction after 200 attempts"
+            )
+
+        end
+
+
+        foreach (filtered_reg_in[i]) begin
+
+            reg_item = filtered_reg_in[i];
+
+
+            `uvm_info(
+                get_type_name(),
+                $sformatf(
+                    "[STEP3] Protected access addr=0x%06h bytes=%0d",
+                    reg_item.flash_start_addr,
+                    reg_item.data_word
+                ),
+                UVM_LOW
+            )
+
+
+            // ----------------------------------------------------
+            // Prepare known original data.
+            //
+            // Use a fixed non-FF value rather than completely
+            // random data.
+            //
+            // Why?
+            //
+            // If we used random data, it is theoretically possible
+            // for an erased value to already be FF, weakening the
+            // erase-failure detection.
+            //
+            // 0xA5 gives us deterministic checking.
+            // ----------------------------------------------------
+            force_flash_fixed_data(
+                8'hA5,
+                reg_item.flash_start_addr,
+                reg_item.data_word
+            );
+
+
+            golden_data =
+                new[reg_item.data_word];
+
+            for (int j = 0;
+                 j < reg_item.data_word;
+                 j++) begin
+
+                golden_data[j] =
+                    `UVM_SYSTEM.i_tcon_rom_1.memory[
+                        reg_item.flash_start_addr + j
+                    ];
+
+            end
+
+
+            // ----------------------------------------------------
+            // Generate program data different from the original
+            // 0xA5 pattern as much as possible.
+            //
+            // 0x00 is useful because a successful flash program
+            // should clearly modify A5 -> 00.
+            // ----------------------------------------------------
+            data.delete();
+
+            for (int j = 0;
+                 j < reg_item.data_word;
+                 j++) begin
+
+                data.push_back(8'h00);
+
+            end
+
+
+            // ====================================================
+            // STEP 3A
+            // Protected Page Program
+            //
+            // Expected:
+            //   memory must remain unchanged.
+            // ====================================================
+
+            `uvm_info(
+                get_type_name(),
+                "[STEP3A] Protected Page Program - expect BLOCKED",
+                UVM_LOW
+            )
+
+
+            i2c_over_spi_write_enable();
+
+            #10us;
+
+            i2c_over_spi_page_program(
+                reg_item.flash_start_addr,
+                data,
+                reg_item.data_word,
+                0
+            );
+
+            #100us;
+
+
+            flash_backdoor_read(
+                reg_item.flash_start_addr,
+                reg_item.data_word,
+                backdoor_read_data
+            );
+
+
+            compare_flash_data(
+                backdoor_read_data,
+                golden_data,
+                reg_item.flash_start_addr,
+                "PROTECTED_PAGE_PROGRAM"
+            );
+
+
+
+            // ====================================================
+            // STEP 3B
+            // Protected Sector Erase
+            //
+            // Expected:
+            //   memory must remain unchanged.
+            // ====================================================
+
+            `uvm_info(
+                get_type_name(),
+                "[STEP3B] Protected Sector Erase - expect BLOCKED",
+                UVM_LOW
+            )
+
+
+            i2c_over_spi_write_enable();
+
+            #10us;
+
+            i2c_over_spi_sector_erase(
+                reg_item.flash_start_addr,
+                0
+            );
+
+            #300us;
+
+
+            flash_backdoor_read(
+                reg_item.flash_start_addr,
+                reg_item.data_word,
+                backdoor_read_data
+            );
+
+
+            compare_flash_data(
+                backdoor_read_data,
+                golden_data,
+                reg_item.flash_start_addr,
+                "PROTECTED_SECTOR_ERASE"
+            );
+
+
+
+            // ====================================================
+            // STEP 3C
+            // Protected Fast Read
+            //
+            // Protection should block program/erase, not read.
+            // ====================================================
+
+            `uvm_info(
+                get_type_name(),
+                "[STEP3C] Protected Fast Read - expect VALID",
+                UVM_LOW
+            )
+
+
+            i2c_over_spi_fast_read(
+                reg_item.flash_start_addr,
+                reg_item.data_word,
+                0
+            );
+
+            #10us;
+
+        end
+
+
+
+        // ========================================================
+        // STEP 4
+        //
+        // Find and test one access completely OUTSIDE protected
+        // partitions.
+        //
+        // Expected:
+        //
+        //   Page Program : VALID
+        //   Sector Erase : VALID
+        //   Fast Read    : VALID
+        //
+        // ========================================================
+
+        `uvm_info(
+            get_type_name(),
+            "===== STEP 4: Unprotected partition test =====",
+            UVM_LOW
+        )
+
+
+        filtered_reg_out.delete();
+
+
+        for (int attempt = 0;
+             (attempt < 200) && (filtered_reg_out.size() == 0);
+             attempt++) begin
+
+            if (!reg_set.randomize()) begin
+
+                `uvm_fatal(
+                    get_type_name(),
+                    "[STEP4] reg_set.randomize() failed"
+                )
+
+            end
+
+
+            filter_addr_by_nvm_partition(
+                nvm_prot_en,
+                nvm_part_start,
+                reg_set,
+                filtered_reg_out,
+                "OUT"
+            );
+
+        end
+
+
+        if (filtered_reg_out.size() == 0) begin
+
+            `uvm_fatal(
+                get_type_name(),
+                "[STEP4] Cannot find a fully accessible transaction after 200 attempts"
+            )
+
+        end
+
+
+        foreach (filtered_reg_out[i]) begin
+
+            reg_item = filtered_reg_out[i];
+
+
+            `uvm_info(
+                get_type_name(),
+                $sformatf(
+                    "[STEP4] Accessible access addr=0x%06h bytes=%0d",
+                    reg_item.flash_start_addr,
+                    reg_item.data_word
+                ),
+                UVM_LOW
+            )
+
+
+            // Generate deterministic program data.
+            data.delete();
+
+            program_expected =
+                new[reg_item.data_word];
+
+
+            for (int j = 0;
+                 j < reg_item.data_word;
+                 j++) begin
+
+                // Use non-FF deterministic data.
+                program_expected[j] =
+                    8'h5A ^ j[7:0];
+
+                data.push_back(
+                    program_expected[j]
+                );
+
+            end
+
+
+            // Start from erased state.
+            force_flash_fixed_data(
+                8'hFF,
+                reg_item.flash_start_addr,
+                reg_item.data_word
+            );
+
+
+            // ====================================================
+            // STEP 4A
+            // Unprotected Page Program
+            //
+            // Expected:
+            //   Program succeeds.
+            // ====================================================
+
+            `uvm_info(
+                get_type_name(),
+                "[STEP4A] Unprotected Page Program - expect VALID",
+                UVM_LOW
+            )
+
+
+            i2c_over_spi_write_enable();
+
+            #10us;
+
+            i2c_over_spi_page_program(
+                reg_item.flash_start_addr,
+                data,
+                reg_item.data_word,
+                0
+            );
+
+            #100us;
+
+
+            flash_backdoor_read(
+                reg_item.flash_start_addr,
+                reg_item.data_word,
+                backdoor_read_data
+            );
+
+
+            // FIX:
+            // Original test only read back the flash but did not
+            // compare against the programmed data.
+            compare_flash_data(
+                backdoor_read_data,
+                program_expected,
+                reg_item.flash_start_addr,
+                "UNPROTECTED_PAGE_PROGRAM"
+            );
+
+
+
+            // ====================================================
+            // STEP 4B
+            // Unprotected Sector Erase
+            //
+            // Expected:
+            //   All checked bytes become FF.
+            // ====================================================
+
+            `uvm_info(
+                get_type_name(),
+                "[STEP4B] Unprotected Sector Erase - expect VALID",
+                UVM_LOW
+            )
+
+
+            i2c_over_spi_write_enable();
+
+            #10us;
+
+            i2c_over_spi_sector_erase(
+                reg_item.flash_start_addr,
+                0
+            );
+
+            #300us;
+
+
+            flash_backdoor_read(
+                reg_item.flash_start_addr,
+                reg_item.data_word,
+                backdoor_read_data
+            );
+
+
+            check_flash_all_ff(
+                backdoor_read_data,
+                reg_item.flash_start_addr
+            );
+
+
+
+            // ====================================================
+            // STEP 4C
+            // Unprotected Fast Read
+            // ====================================================
+
+            `uvm_info(
+                get_type_name(),
+                "[STEP4C] Unprotected Fast Read - expect VALID",
+                UVM_LOW
+            )
+
+
+            i2c_over_spi_fast_read(
+                reg_item.flash_start_addr,
+                reg_item.data_word,
+                0
+            );
+
+            #10us;
+
+        end
+
+
+        `uvm_info(
+            get_type_name(),
+            "===== i2c_over_spi_access_block_test COMPLETE =====",
+            UVM_LOW
+        )
+
+
+        phase.drop_objection(this);
+
+    endtask : run_phase
+
+
+endclass : i2c_over_spi_access_block_test
