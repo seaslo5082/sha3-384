@@ -1,5 +1,6 @@
 // ============================================================================
-// mcu_sha_read_salt_test.sv
+// mcu_sha_read_salt_test_debug_v2.sv
+// NEW: 2026-09-30 TC2/TC3 rate completion synchronization and TC8 mask diagnostics
 // RTL-aligned SHA3-384 MCU access verification test
 //
 // FLOW MAP
@@ -37,6 +38,8 @@
 // - final_trigger uses FC=0x0C (or 0x8C for mask) to retain mcu_access_en.
 // - TC9 checks internal sha3_top.salt_data, NOT F8/reg_salt.
 // - TC6/TC7 assume the external SALT input is already valid in the environment.
+// - NEW: TC2/TC3 wait FC[6] before final; TC8 uses EC=0 as a diagnostic.
+// - NEW: This file is NOT simulator-verified in the proprietary RTL environment.
 // ============================================================================
 class mcu_sha_read_salt_test extends host_base_test;
 
@@ -552,6 +555,13 @@ class mcu_sha_read_salt_test extends host_base_test;
 
         prepare_message_length();
 
+        // MODIFY TC8: Use 1 byte per MCU D4 write instead of 4.
+        // This isolates the mask threshold (rcnt_sum == 32) and avoids
+        // assuming that the RTL replaces an entire 4-byte transaction.
+        // This is a diagnostic workaround, NOT proof that 4-byte masking works.
+        block_wr_num = 2'd0;
+        `uvm_info("TC8_MASK_DEBUG", "MODIFY: use EC=0 (1 byte/write) to isolate mask threshold", UVM_LOW)
+
         mask_data = new[4];
 
         mask_data[0] = 8'hAA;
@@ -854,6 +864,16 @@ class mcu_sha_read_salt_test extends host_base_test;
 
         mcu_word_wr(m_host_top_cfg.sha384_page_addr_1, 8'hFC, access_ctrl);
 
+        // NEW TC8: Confirm FC[7] is active at the beginning of MCU injection.
+        // A readback alone does not prove the internal mask branch is taken.
+        if (mask_enable) begin
+            bit [31:0] fc_mask;
+            mcu_word_rd(m_host_top_cfg.sha384_page_addr_1, 8'hFC, fc_mask);
+            if (fc_mask[7] !== 1'b1 || fc_mask[2] !== 1'b1)
+                `uvm_fatal("SHA3_MASK_ACCESS", $sformatf("NEW: FC mask/access mismatch FC=%08h", fc_mask))
+            `uvm_info("SHA3_MASK_ACCESS", $sformatf("NEW: FC=%08h; observe rcnt_sum/mask_cnt on D4 writes", fc_mask), UVM_LOW)
+        end
+
         // --------------------------------------------------------
         // Write message to D4
         // --------------------------------------------------------
@@ -874,10 +894,25 @@ class mcu_sha_read_salt_test extends host_base_test;
 
             `uvm_info("SHA3_DATA_WRITE", $sformatf({ "idx=%0d ", "bytes_per_write=%0d ", "block_wr_num=%0d ", "pwdata=%08h" }, idx, bytes_per_write, block_wr_num, pwdata), UVM_HIGH)
 
+            // NEW: Log the expected mask interval without modifying RTL state.
+            if (mask_enable && idx >= mask_start_byte-1 && idx <= mask_start_byte+mask_data.size())
+                `uvm_info("SHA3_MASK_WINDOW", $sformatf("NEW: before D4 idx=%0d data=%08h mask_start=%0d", idx, pwdata, mask_start_byte), UVM_LOW)
             mcu_word_wr(m_host_top_cfg.sha384_page_addr_1, 8'hD4, pwdata);
 
             idx += bytes_per_write;
 
+        end
+
+        // NEW TC2/TC3: For messages filling or crossing the 104-byte SHA3-384
+        // rate, wait for the first permutation to complete before finalizing.
+        // FC[6] READ = block_cnt_once_flag; FC[6] WRITE = reset_hash.
+        // Never poll this bit with a write, and never write back a read value.
+        // IMPORTANT: TC3 crosses the boundary inside a 3-byte D4 transaction.
+        // The RTL must retain the overflow byte; the wait cannot repair a
+        // broken block_temp_overflow implementation.
+        if (sha_data.size() >= SHA3_RATE_BYTES) begin
+            `uvm_info("SHA3_RATE_SYNC", $sformatf("NEW: wait first block done before final; len=%0d", sha_data.size()), UVM_LOW)
+            wait_sha3_block_done();
         end
 
         // --------------------------------------------------------
@@ -903,6 +938,22 @@ class mcu_sha_read_salt_test extends host_base_test;
     // FC[5] = digest_valid
     // ============================================================
 
+    // NEW: FC[6] read-only status (block_cnt_once_flag).
+    // Do not confuse this read status with FC[6] write pulse reset_hash.
+    task automatic wait_sha3_block_done();
+        bit [31:0] fc;
+        for (int unsigned retry = 0; retry < SHA3_MAX_RETRY; retry++) begin
+            mcu_word_rd(m_host_top_cfg.sha384_page_addr_1, 8'hFC, fc);
+            if (fc[6] === 1'b1) begin
+                `uvm_info("SHA3_BLOCK_DONE", $sformatf("NEW: FC[6]=1, retry=%0d FC=%08h", retry, fc), UVM_LOW)
+                return;
+            end
+            #100ns;
+        end
+        `uvm_fatal("SHA3_BLOCK_TIMEOUT", $sformatf("NEW: FC[6] did not assert before final; FC=%08h", fc))
+    endtask
+
+    // MODIFY: final digest polling remains FC[5], NOT FC[6].
     task automatic wait_sha3_done();
 
         bit [31:0] rdata;
