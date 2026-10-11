@@ -1,0 +1,888 @@
+//======================================================================
+// VPlan #136 : SPI Master Access Blocking
+//
+// Test:
+//   1. Page Program
+//   2. Sector Erase
+//   3. Block Erase
+//   4. Chip Erase
+//   5. Fast Read
+//
+// Based on confirmed RTL:
+//
+// nvm_prot_en_real =
+//     nvm_prot_en & (~{4{spi_write_en}});
+//
+// spi_write_en = EFF_MCU_DEBUG_EN
+//
+// Protected address + DEBUG=0:
+//   Page Program / Sector / Block Erase -> BLOCK
+//   Fast Read                           -> VALID
+//
+// Any enabled valid protected range + DEBUG=0:
+//   Chip Erase -> BLOCK
+//
+// [MODIFY]
+// Do not use the previous reversed IN/OUT expectations.
+//
+// [NEW]
+// Read back into a separate DRAM buffer.
+//
+// [NEW]
+// Verify programmed data before issuing blocked erase.
+//
+// [NEW]
+// Check both beginning and end of erase regions.
+//======================================================================
+
+class spi_master_access_block_test extends host_mcu_spi_base_test;
+
+    `uvm_component_utils(spi_master_access_block_test)
+
+    localparam int SPI_NUM = 255;
+
+    localparam logic [3:0] PROT_ON = 4'b0010;
+
+    // [MODIFY] RTL appends 12'h000.
+    localparam logic [19:0] PART0 = 20'h00020;
+    localparam logic [19:0] PART1 = 20'h00040;
+    localparam logic [19:0] PART2 = 20'h00060;
+
+    // Protected range[1]: 0x20000 ~ 0x3FFFF.
+    localparam logic [23:0] ADDR_PROT = 24'h030000;
+
+    // Unprotected range[2]: 0x40000 ~ 0x5FFFF.
+    localparam logic [23:0] ADDR_FREE = 24'h050000;
+
+    localparam int SECTOR_SIZE = 'h1000;
+    localparam int BLOCK_SIZE  = 'h10000;
+
+    logic [19:0] nvm_part_start[3];
+
+    // [NEW] Keep source and destination buffers separate.
+    //
+    // Must ensure DRAM has room for both regions.
+    // Keeping SRC at the original known-good address.
+    //
+    // m_host_top_cfg.mcu_dram_addr_st = SRC
+    // SRC + 0x200                    = DST
+
+    function new(
+        string name = "spi_master_access_block_test",
+        uvm_component parent = null
+    );
+        super.new(name, parent);
+    endfunction
+
+
+    //==================================================================
+    // [MODIFY] Apply Access Blocking configuration
+    //
+    // WHY:
+    // Centralize policy updates to avoid inconsistent settings.
+    //
+    // NOTE:
+    // These two helpers must be available in this class/base test.
+    //==================================================================
+
+    virtual task apply_policy(
+        input logic [3:0] prot_en,
+        input bit debug_en
+    );
+
+        `uvm_info(
+            get_type_name(),
+            $sformatf(
+                "[136][CFG] PROT=%h DEBUG=%0d",
+                prot_en, debug_en
+            ),
+            UVM_LOW
+        )
+
+        spi_nvm_partitioning_config(
+            prot_en,
+            nvm_part_start
+        );
+
+        set_eff_mcu_debug_en(debug_en);
+
+        #2us;
+
+    endtask
+
+
+    //==================================================================
+    // [NEW] Source-data initialization
+    //
+    // WHY:
+    // Prepare data only once for a stable golden pattern.
+    // Avoid changing the expected data between Chip Erase probes.
+    //
+    // IMPORTANT:
+    // exlm_spi_wr_mem_pp must produce non-FF data, otherwise blocked
+    // erase detection may be ineffective.
+    //==================================================================
+
+    virtual task prepare_source();
+
+        exlm_spi_wr_mem_pp(
+            m_host_top_cfg.mcu_dram_addr_st,
+            SPI_NUM
+        );
+
+    endtask
+
+
+    //==================================================================
+    // [NEW] Setup-only Sector Erase
+    //
+    // WHY:
+    // Before constructing known Flash contents, debug bypass is used.
+    // This is NOT the erase operation being verified.
+    //==================================================================
+
+    virtual task setup_erase_sector(
+        input logic [23:0] addr
+    );
+
+        set_eff_mcu_debug_en(1'b1);
+
+        #2us;
+
+        mcu_spi_write_enable();
+
+        mcu_spi_sector_erase(
+            addr,
+            32'h0
+        );
+
+        // Same reference delay as existing SPI erase tests.
+        // Replace with WIP polling once its helper is confirmed.
+        #50us;
+
+        backdoor_check_fixed_value(
+            8'hFF,
+            addr,
+            256
+        );
+
+    endtask
+
+
+    //==================================================================
+    // [NEW] Setup-only Page Program
+    //
+    // WHY:
+    // Construct a known non-FF Flash baseline.
+    //
+    // Caller must erase the destination beforehand.
+    //==================================================================
+
+    virtual task setup_program_page(
+        input logic [23:0] addr
+    );
+
+        set_eff_mcu_debug_en(1'b1);
+
+        #2us;
+
+        mcu_spi_write_enable();
+
+        mcu_spi_page_program(
+            addr,
+            0,
+            10'h0FF,
+            m_host_top_cfg.mcu_dram_addr_st
+        );
+
+        #20us;
+
+        backdoor_check(
+            addr,
+            m_host_top_cfg.mcu_dram_addr_st,
+            SPI_NUM
+        );
+
+    endtask
+
+
+    //==================================================================
+    // [NEW] Prepare two programmed pages for erase testing
+    //
+    // WHY:
+    // Checking only the first page may miss erase-boundary bugs.
+    //
+    // For Sector Erase:
+    //   First page : base
+    //   Last page  : base + 0xF00
+    //
+    // For Block Erase:
+    //   First page : base
+    //   Last page  : base + 0xFF00
+    //
+    // The final sector of a block is erased separately during setup.
+    //==================================================================
+
+    virtual task prepare_erase_baseline(
+        input logic [23:0] addr,
+        input int region_size
+    );
+
+        logic [23:0] last_page;
+
+        last_page = addr + region_size - 256;
+
+        setup_erase_sector(addr);
+
+        if (region_size > SECTOR_SIZE) begin
+            setup_erase_sector(last_page);
+        end
+
+        setup_program_page(addr);
+
+        setup_program_page(last_page);
+
+        // Verify both known-data preconditions.
+        backdoor_check(
+            addr,
+            m_host_top_cfg.mcu_dram_addr_st,
+            SPI_NUM
+        );
+
+        backdoor_check(
+            last_page,
+            m_host_top_cfg.mcu_dram_addr_st,
+            SPI_NUM
+        );
+
+    endtask
+
+
+    //==================================================================
+    // PAGE PROGRAM
+    //
+    // [MODIFY] Use actual RTL protection expectations.
+    //
+    // Blocked:
+    //   Flash must remain FF.
+    //
+    // Allowed:
+    //   Flash must equal original DRAM source data.
+    //==================================================================
+
+    virtual task check_page_program(
+        input logic [23:0] addr,
+        input bit expect_block,
+        input bit debug_en
+    );
+
+        `uvm_info(
+            get_type_name(),
+            $sformatf(
+                "[136][PP] ADDR=%h BLOCK=%0d DEBUG=%0d",
+                addr, expect_block, debug_en
+            ),
+            UVM_LOW
+        )
+
+        // [NEW] Build a clean erased baseline.
+        setup_erase_sector(addr);
+
+        // [MODIFY] Restore policy before actual operation.
+        set_eff_mcu_debug_en(debug_en);
+
+        #2us;
+
+        mcu_spi_write_enable();
+
+        mcu_spi_page_program(
+            addr,
+            0,
+            10'h0FF,
+            m_host_top_cfg.mcu_dram_addr_st
+        );
+
+        #20us;
+
+        if (expect_block) begin
+
+            // [NEW] Blocked Program must not modify Flash.
+            backdoor_check_fixed_value(
+                8'hFF,
+                addr,
+                256
+            );
+
+        end
+        else begin
+
+            // Allowed Program must match independent source data.
+            backdoor_check(
+                addr,
+                m_host_top_cfg.mcu_dram_addr_st,
+                SPI_NUM
+            );
+
+        end
+
+    endtask
+
+
+    //==================================================================
+    // FAST READ
+    //
+    // [MODIFY] Use a different DRAM destination.
+    //
+    // WHY:
+    // Reading into the original Page Program source buffer could
+    // overwrite the golden data and create false PASS results.
+    //
+    // Read is expected VALID regardless of NVM protection.
+    //==================================================================
+
+    virtual task check_fast_read(
+        input logic [23:0] addr,
+        input bit debug_en
+    );
+
+        logic [31:0] dst_addr;
+
+        dst_addr =
+            m_host_top_cfg.mcu_dram_addr_st + 'h200;
+
+        set_eff_mcu_debug_en(debug_en);
+
+        #2us;
+
+        mcu_spi_fast_read(
+            SPI_NUM,
+            addr,
+            dst_addr,
+            0
+        );
+
+        #5us;
+
+        // [NEW] Compare actual Flash contents with MCU read buffer.
+        backdoor_check(
+            addr,
+            dst_addr,
+            SPI_NUM
+        );
+
+    endtask
+
+
+    //==================================================================
+    // SECTOR ERASE
+    //
+    // [NEW] Check first and last page.
+    //
+    // Blocked:
+    //   Both programmed pages must remain unchanged.
+    //
+    // Allowed:
+    //   Both pages must become FF.
+    //==================================================================
+
+    virtual task check_sector_erase(
+        input logic [23:0] addr,
+        input bit expect_block,
+        input bit debug_en
+    );
+
+        logic [23:0] last_page;
+
+        last_page = addr + SECTOR_SIZE - 256;
+
+        `uvm_info(
+            get_type_name(),
+            $sformatf(
+                "[136][SE] ADDR=%h BLOCK=%0d",
+                addr, expect_block
+            ),
+            UVM_LOW
+        )
+
+        // Prepare known data at both ends of sector.
+        prepare_erase_baseline(
+            addr,
+            SECTOR_SIZE
+        );
+
+        // Actual protection condition starts here.
+        set_eff_mcu_debug_en(debug_en);
+
+        #2us;
+
+        mcu_spi_write_enable();
+
+        mcu_spi_sector_erase(
+            addr,
+            32'h0
+        );
+
+        #50us;
+
+        if (expect_block) begin
+
+            backdoor_check(
+                addr,
+                m_host_top_cfg.mcu_dram_addr_st,
+                SPI_NUM
+            );
+
+            backdoor_check(
+                last_page,
+                m_host_top_cfg.mcu_dram_addr_st,
+                SPI_NUM
+            );
+
+        end
+        else begin
+
+            backdoor_check_fixed_value(
+                8'hFF,
+                addr,
+                256
+            );
+
+            backdoor_check_fixed_value(
+                8'hFF,
+                last_page,
+                256
+            );
+
+        end
+
+    endtask
+
+
+    //==================================================================
+    // BLOCK ERASE
+    //
+    // [NEW] Check both ends of the 64KB block.
+    //
+    // WHY:
+    // A Block Erase bug may incorrectly erase only some sectors.
+    // Checking both ends improves detection.
+    //==================================================================
+
+    virtual task check_block_erase(
+        input logic [23:0] addr,
+        input bit expect_block,
+        input bit debug_en
+    );
+
+        logic [23:0] block_addr;
+        logic [23:0] last_page;
+
+        block_addr = {addr[23:16], 16'h0000};
+
+        last_page = block_addr + BLOCK_SIZE - 256;
+
+        `uvm_info(
+            get_type_name(),
+            $sformatf(
+                "[136][BE] ADDR=%h BLOCK=%0d",
+                block_addr, expect_block
+            ),
+            UVM_LOW
+        )
+
+        prepare_erase_baseline(
+            block_addr,
+            BLOCK_SIZE
+        );
+
+        set_eff_mcu_debug_en(debug_en);
+
+        #2us;
+
+        mcu_spi_write_enable();
+
+        mcu_spi_block_erase(
+            block_addr,
+            32'h0
+        );
+
+        #50us;
+
+        if (expect_block) begin
+
+            backdoor_check(
+                block_addr,
+                m_host_top_cfg.mcu_dram_addr_st,
+                SPI_NUM
+            );
+
+            backdoor_check(
+                last_page,
+                m_host_top_cfg.mcu_dram_addr_st,
+                SPI_NUM
+            );
+
+        end
+        else begin
+
+            backdoor_check_fixed_value(
+                8'hFF,
+                block_addr,
+                256
+            );
+
+            backdoor_check_fixed_value(
+                8'hFF,
+                last_page,
+                256
+            );
+
+        end
+
+    endtask
+
+
+    //==================================================================
+    // CHIP ERASE
+    //
+    // [MODIFY] Do not associate Chip Erase with a single address.
+    //
+    // RTL:
+    //   chip_erase_violation_set =
+    //       chip_erase_cmd & nvm_prot_en & valid_range
+    //
+    // [NEW] Set up two separate Flash regions.
+    //
+    // Allowed:
+    //   Both must become FF.
+    //
+    // Blocked:
+    //   Both must preserve the original programmed pattern.
+    //==================================================================
+
+    virtual task check_chip_erase(
+        input bit expect_block,
+        input bit debug_en
+    );
+
+        `uvm_info(
+            get_type_name(),
+            $sformatf(
+                "[136][CE] BLOCK=%0d DEBUG=%0d",
+                expect_block, debug_en
+            ),
+            UVM_LOW
+        )
+
+        // Prepare two independent regions.
+        prepare_erase_baseline(
+            ADDR_PROT,
+            SECTOR_SIZE
+        );
+
+        prepare_erase_baseline(
+            ADDR_FREE,
+            SECTOR_SIZE
+        );
+
+        // Restore intended debug state.
+        set_eff_mcu_debug_en(debug_en);
+
+        #2us;
+
+        mcu_spi_write_enable();
+
+        mcu_spi_chip_erase();
+
+        #50us;
+
+        if (expect_block) begin
+
+            // [NEW] Chip Erase must not erase either region.
+            backdoor_check(
+                ADDR_PROT,
+                m_host_top_cfg.mcu_dram_addr_st,
+                SPI_NUM
+            );
+
+            backdoor_check(
+                ADDR_FREE,
+                m_host_top_cfg.mcu_dram_addr_st,
+                SPI_NUM
+            );
+
+        end
+        else begin
+
+            backdoor_check_fixed_value(
+                8'hFF,
+                ADDR_PROT,
+                256
+            );
+
+            backdoor_check_fixed_value(
+                8'hFF,
+                ADDR_FREE,
+                256
+            );
+
+        end
+
+    endtask
+
+
+    //==================================================================
+    // [NEW] Run address-based operations with one expected policy.
+    //
+    // Page Program:
+    //   Actual permission check.
+    //
+    // Fast Read:
+    //   A separate non-FF baseline is created so read remains meaningful
+    //   even when Page Program was blocked.
+    //
+    // Sector / Block Erase:
+    //   Independent baselines are created for each operation.
+    //==================================================================
+
+    virtual task run_address_suite(
+        input logic [23:0] addr,
+        input bit expect_block,
+        input bit debug_en
+    );
+
+        // 1. Page Program
+        check_page_program(
+            addr,
+            expect_block,
+            debug_en
+        );
+
+        // 2. Fast Read
+        // Construct known contents via debug bypass first.
+        //
+        // WHY:
+        // This checks read access to non-FF data even in protected range.
+        prepare_erase_baseline(
+            addr,
+            SECTOR_SIZE
+        );
+
+        check_fast_read(
+            addr,
+            debug_en
+        );
+
+        // 3. Sector Erase
+        check_sector_erase(
+            addr,
+            expect_block,
+            debug_en
+        );
+
+        // 4. Block Erase
+        check_block_erase(
+            addr,
+            expect_block,
+            debug_en
+        );
+
+    endtask
+
+
+    //==================================================================
+    // RUN PHASE
+    //==================================================================
+
+    task run_phase(uvm_phase phase);
+
+        super.run_phase(phase);
+
+        phase.raise_objection(
+            this,
+            "Start VPlan 136"
+        );
+
+        `uvm_info(
+            get_type_name(),
+            "[136] START",
+            UVM_LOW
+        )
+
+        //==============================================================
+        // Common initialization
+        //==============================================================
+
+        mcu_test_preset();
+
+        // Same SPI setup as existing Page Program test.
+        mcu_spi_disable_auto_rdsr(1);
+
+        // [MODIFY] Correct 4KB-based partition configuration.
+        nvm_part_start[0] = PART0;
+        nvm_part_start[1] = PART1;
+        nvm_part_start[2] = PART2;
+
+        // [NEW] Prepare one stable source pattern.
+        prepare_source();
+
+
+        //==============================================================
+        // VPLAN136-1
+        //
+        // NVM_PROT_EN = 0
+        // DEBUG       = 0
+        //
+        // Expected:
+        //   PP / SE / BE / CE / READ -> VALID
+        //
+        // WHY DEBUG=0:
+        // This independently tests the effect of PROT_EN=0
+        // without relying on debug bypass.
+        //==============================================================
+
+        `uvm_info(
+            get_type_name(),
+            "[136-1] Protection disabled",
+            UVM_LOW
+        )
+
+        apply_policy(
+            4'b0000,
+            1'b0
+        );
+
+        run_address_suite(
+            ADDR_PROT,
+            1'b0,          // expect_block
+            1'b0           // debug_en
+        );
+
+        check_chip_erase(
+            1'b0,
+            1'b0
+        );
+
+
+        //==============================================================
+        // VPLAN136-2
+        //
+        // NVM_PROT_EN = 0010
+        // DEBUG       = 1
+        //
+        // Address intentionally hits protected range[1].
+        //
+        // Expected:
+        //   PP / SE / BE / CE / READ -> VALID
+        //
+        // [MODIFY]
+        // Testing an otherwise blocked address truly verifies bypass.
+        //==============================================================
+
+        `uvm_info(
+            get_type_name(),
+            "[136-2] Debug bypass",
+            UVM_LOW
+        )
+
+        apply_policy(
+            PROT_ON,
+            1'b1
+        );
+
+        run_address_suite(
+            ADDR_PROT,
+            1'b0,
+            1'b1
+        );
+
+        check_chip_erase(
+            1'b0,
+            1'b1
+        );
+
+
+        //==============================================================
+        // VPLAN136-3
+        //
+        // NVM_PROT_EN = 0010
+        // DEBUG       = 0
+        // Address     = 0x30000 (inside protected range)
+        //
+        // Expected:
+        //   PP / SE / BE -> BLOCK
+        //   READ         -> VALID
+        //
+        // Chip Erase also blocked because an enabled, valid
+        // protected range exists.
+        //==============================================================
+
+        `uvm_info(
+            get_type_name(),
+            "[136-3] Protected range",
+            UVM_LOW
+        )
+
+        apply_policy(
+            PROT_ON,
+            1'b0
+        );
+
+        run_address_suite(
+            ADDR_PROT,
+            1'b1,
+            1'b0
+        );
+
+        check_chip_erase(
+            1'b1,
+            1'b0
+        );
+
+
+        //==============================================================
+        // VPLAN136-4
+        //
+        // NVM_PROT_EN = 0010
+        // DEBUG       = 0
+        // Address     = 0x50000 (outside protected range)
+        //
+        // Expected:
+        //   PP / SE / BE / READ -> VALID
+        //
+        // Chip Erase is intentionally excluded here because
+        // its permission is global, not address-dependent.
+        //==============================================================
+
+        `uvm_info(
+            get_type_name(),
+            "[136-4] Unprotected range",
+            UVM_LOW
+        )
+
+        apply_policy(
+            PROT_ON,
+            1'b0
+        );
+
+        run_address_suite(
+            ADDR_FREE,
+            1'b0,
+            1'b0
+        );
+
+
+        `uvm_info(
+            get_type_name(),
+            "[136] ALL SCENARIOS COMPLETED",
+            UVM_LOW
+        )
+
+        phase.drop_objection(
+            this,
+            "Finish VPlan 136"
+        );
+
+    endtask
+
+endclass
