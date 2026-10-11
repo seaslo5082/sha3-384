@@ -1,0 +1,306 @@
+//======================================================================
+// VPlan #135 : I2C-over-SPI Access Blocking
+//
+// Initiator : I2C-to-SPI bridge (I2C master model)
+// Target    : SPI Leader (external NVM, SPI0)
+//
+// [MODIFY] Reuse VPlan #136's deterministic partition/policy matrix.
+// [MODIFY] All tested SPI operations go through i2c_over_spi_*().
+// [NEW]    Each operation prepares and checks an independent baseline.
+// [NEW]    Program, sector/block erase, chip erase, fast-read scenarios.
+// [NEW]    Check both ends of an erase region where applicable.
+//
+// REQUIREMENTS FROM EXISTING BASE TEST (NOT reimplemented here):
+//   mcu_test_preset(), i2c_over_spi_test_preset(),
+//   set_eff_mcu_debug_en(), spi_nvm_partitioning_config(),
+//   i2c_over_spi_write_enable(), i2c_over_spi_page_program(),
+//   i2c_over_spi_sector_erase(), i2c_over_spi_block_erase(),
+//   i2c_over_spi_chip_erase(), i2c_over_spi_fast_read(),
+//   flash_backdoor_read().
+//
+// VERIFY BEFORE REGRESSION:
+//   A) i2c_over_spi_chip_erase() name/signature is available.
+//   B) SPI0 is the same flash instance targeted by force_nvm_protect().
+//   C) I2C read monitor/scoreboard compares the received payload.
+//   D) Replace fixed delays with model-appropriate WIP polling.
+//   E) Additional initiator-rule gating of DEBUG=0 must be checked.
+//======================================================================
+
+class i2c_over_spi_access_block_test extends host_i2c_over_spi_base_test;
+    `uvm_component_utils(i2c_over_spi_access_block_test)
+
+    localparam bit [1:0] SPI_SELECT = 2'd0;  // SPI0 = external NVM
+    localparam int PP_BYTES = 255;          // 255 bytes; stays inside a 256B page
+    localparam int PAGE_SIZE = 'h100;
+    localparam int SECTOR_SIZE = 'h1000;
+    localparam int BLOCK_SIZE = 'h10000;
+
+    localparam logic [3:0] PROT_ON = 4'b0010;
+    localparam logic [19:0] PART0 = 20'h00020;
+    localparam logic [19:0] PART1 = 20'h00040;
+    localparam logic [19:0] PART2 = 20'h00060;
+    localparam logic [23:0] ADDR_PROT = 24'h030000;
+    localparam logic [23:0] ADDR_FREE = 24'h050000;
+
+    logic [19:0] nvm_part_start[3];
+
+    function new(string name = "i2c_over_spi_access_block_test",
+                 uvm_component parent = null);
+        super.new(name, parent);
+    endfunction
+
+    // [NEW] Central configuration entry: only effective protection
+    // settings are forced by TB, not the access transactions themselves.
+    virtual task apply_policy(input logic [3:0] prot_en,
+                              input bit debug_en);
+        `uvm_info(get_type_name(),
+            $sformatf("[135][CFG] NVM_PROT=%h EFF_MCU_DEBUG=%0b",prot_en,debug_en),UVM_LOW)
+        spi_nvm_partitioning_config(prot_en, nvm_part_start);
+        set_eff_mcu_debug_en(debug_en);
+        #2us;
+    endtask
+
+    // [NEW] Reproducible, non-FF data. The queue is fresh for every
+    // call because the inherited page-program task pop_front()s data.
+    virtual task make_program_data(output byte data[$]);
+        data.delete();
+        for (int i = 0; i < PP_BYTES; i++)
+            data.push_back(byte'(1 + (i % 200)));
+    endtask
+
+    // [NEW] Independently observe the flash model without modifying it.
+    // This proves the content exists before/after the tested operation.
+    virtual task check_flash_constant(input logic [23:0] addr,
+                                      input int unsigned nbytes,
+                                      input logic [7:0] expected,
+                                      input string tag);
+        logic [7:0] got[];
+        flash_backdoor_read(addr, nbytes, got);
+        if (got.size() != nbytes)
+            `uvm_fatal(get_type_name(),
+                $sformatf("[%s] Size mismatch got=%0d expected=%0d",tag,got.size(),nbytes))
+        for (int i = 0; i < nbytes; i++) begin
+            if (got[i] !== expected)
+                `uvm_error(get_type_name(),
+                    $sformatf("[%s] addr=%06h expected=%02h got=%02h",tag,addr+i,expected,got[i]))
+        end
+    endtask
+
+    // [NEW] Byte-for-byte comparison with a pattern generated before
+    // the SPI transaction; the checker does not assume it succeeded.
+    virtual task check_flash_pattern(input logic [23:0] addr,
+                                     input string tag);
+        logic [7:0] got[];
+        logic [7:0] expected;
+        flash_backdoor_read(addr, PP_BYTES, got);
+        if (got.size() != PP_BYTES)
+            `uvm_fatal(get_type_name(),
+                $sformatf("[%s] Size mismatch got=%0d expected=%0d",tag,got.size(),PP_BYTES))
+        for (int i = 0; i < PP_BYTES; i++) begin
+            expected = 8'(1 + (i % 200));
+            if (got[i] !== expected)
+                `uvm_error(get_type_name(),
+                    $sformatf("[%s] addr=%06h expected=%02h got=%02h",tag,addr+i,expected,got[i]))
+        end
+    endtask
+
+    // [NEW] Setup: perform an actual I2C-over-SPI sector erase under
+    // debug bypass. This is preparation, NOT the measured erase check.
+    virtual task setup_erase_sector(input logic [23:0] addr);
+        logic [23:0] base;
+        base = {addr[23:12],12'h000};
+        set_eff_mcu_debug_en(1'b1);
+        #2us;
+        i2c_over_spi_write_enable(SPI_SELECT);
+        i2c_over_spi_sector_erase(base,SPI_SELECT);
+        #300us; // TODO: replace with WIP/BUSY completion polling
+        check_flash_constant(base,PP_BYTES,8'hFF,"SETUP_ERASE");
+    endtask
+
+    // [NEW] Setup: real I2C-to-SPI Page Program with known data.
+    virtual task setup_program_page(input logic [23:0] addr);
+        byte data[$];
+        make_program_data(data);
+        set_eff_mcu_debug_en(1'b1);
+        #2us;
+        i2c_over_spi_write_enable(SPI_SELECT);
+        i2c_over_spi_page_program(addr,data,PP_BYTES,SPI_SELECT);
+        #100us; // TODO: replace with WIP/BUSY completion polling
+        check_flash_pattern(addr,"SETUP_PROGRAM");
+    endtask
+
+    // [NEW] An erase check observes both the first and last pages.
+    // For block erase, the last page lies in another sector and must
+    // be erased separately during preparation.
+    virtual task prepare_erase_baseline(input logic [23:0] addr,
+                                        input int unsigned region_size);
+        logic [23:0] last_page;
+        if ((addr % region_size) != 0)
+            `uvm_fatal(get_type_name(),"Erase baseline address must be region-aligned")
+        last_page = addr + region_size - PAGE_SIZE;
+        setup_erase_sector(addr);
+        if (region_size > SECTOR_SIZE)
+            setup_erase_sector(last_page);
+        setup_program_page(addr);
+        setup_program_page(last_page);
+        check_flash_pattern(addr,"BASELINE_FIRST");
+        check_flash_pattern(last_page,"BASELINE_LAST");
+    endtask
+
+    // [MODIFY] Program access is checked with a known FF baseline.
+    // BLOCK: unchanged FF; ALLOW: all 255 bytes equal source pattern.
+    virtual task check_page_program(input logic [23:0] addr,
+                                    input bit expect_block,
+                                    input bit debug_en);
+        byte data[$];
+        `uvm_info(get_type_name(),
+            $sformatf("[135][PP] addr=%06h block=%0b debug=%0b",addr,expect_block,debug_en),UVM_LOW)
+        setup_erase_sector(addr);
+        set_eff_mcu_debug_en(debug_en);
+        #2us;
+        make_program_data(data);
+        i2c_over_spi_write_enable(SPI_SELECT);
+        i2c_over_spi_page_program(addr,data,PP_BYTES,SPI_SELECT);
+        #100us;
+        if (expect_block)
+            check_flash_constant(addr,PP_BYTES,8'hFF,"BLOCKED_PP");
+        else
+            check_flash_pattern(addr,"ALLOWED_PP");
+    endtask
+
+    // [MODIFY] Read a *non-FF* programmed region. The real frontdoor
+    // data comparison must still be enabled in the I2C-over-SPI SCB.
+    // This backdoor check only ensures the memory was not corrupted.
+    virtual task check_fast_read(input logic [23:0] addr,
+                                 input bit debug_en);
+        `uvm_info(get_type_name(),
+            $sformatf("[135][READ] addr=%06h debug=%0b; I2C SCB must check RX data",addr,debug_en),UVM_LOW)
+        setup_erase_sector(addr);
+        setup_program_page(addr);
+        set_eff_mcu_debug_en(debug_en);
+        #2us;
+        i2c_over_spi_fast_read(addr,PP_BYTES,SPI_SELECT);
+        #10us;
+        check_flash_pattern(addr,"AFTER_FAST_READ");
+    endtask
+
+    // [NEW] Sector/block erase share the same checker and setup.
+    virtual task check_region_erase(input logic [23:0] addr,
+                                    input int unsigned region_size,
+                                    input bit expect_block,
+                                    input bit debug_en);
+        logic [23:0] last_page;
+        last_page = addr + region_size - PAGE_SIZE;
+        `uvm_info(get_type_name(),
+            $sformatf("[135][ERASE] addr=%06h size=%0d block=%0b",addr,region_size,expect_block),UVM_LOW)
+        prepare_erase_baseline(addr,region_size);
+        set_eff_mcu_debug_en(debug_en);
+        #2us;
+        i2c_over_spi_write_enable(SPI_SELECT);
+        if (region_size == SECTOR_SIZE) begin
+            i2c_over_spi_sector_erase(addr,SPI_SELECT);
+            #300us;
+        end
+        else if (region_size == BLOCK_SIZE) begin
+            i2c_over_spi_block_erase(addr,SPI_SELECT);
+            #1ms;
+        end
+        else
+            `uvm_fatal(get_type_name(),"Unsupported erase region size")
+        if (expect_block) begin
+            check_flash_pattern(addr,"BLOCKED_ERASE_FIRST");
+            check_flash_pattern(last_page,"BLOCKED_ERASE_LAST");
+        end
+        else begin
+            check_flash_constant(addr,PAGE_SIZE,8'hFF,"ERASED_FIRST");
+            check_flash_constant(last_page,PAGE_SIZE,8'hFF,"ERASED_LAST");
+        end
+    endtask
+
+    // [NEW] Chip Erase is GLOBAL: not an address-specific allow list.
+    // Any valid protected partition can cause chip erase to be denied.
+    // Check samples at both ends of BOTH test regions.
+    virtual task check_chip_erase(input bit expect_block,
+                                  input bit debug_en);
+        logic [23:0] p_last,f_last;
+        p_last = ADDR_PROT + SECTOR_SIZE - PAGE_SIZE;
+        f_last = ADDR_FREE + SECTOR_SIZE - PAGE_SIZE;
+        `uvm_info(get_type_name(),
+            $sformatf("[135][CHIP_ERASE] block=%0b debug=%0b",expect_block,debug_en),UVM_LOW)
+        prepare_erase_baseline(ADDR_PROT,SECTOR_SIZE);
+        prepare_erase_baseline(ADDR_FREE,SECTOR_SIZE);
+        set_eff_mcu_debug_en(debug_en);
+        #2us;
+        i2c_over_spi_write_enable(SPI_SELECT);
+        // Confirm this inherited helper's exact name/signature.
+        i2c_over_spi_chip_erase(SPI_SELECT);
+        #5ms; // TODO: replace with WIP/BUSY completion polling
+        if (expect_block) begin
+            check_flash_pattern(ADDR_PROT,"CHIP_BLOCK_P_FIRST");
+            check_flash_pattern(p_last,"CHIP_BLOCK_P_LAST");
+            check_flash_pattern(ADDR_FREE,"CHIP_BLOCK_F_FIRST");
+            check_flash_pattern(f_last,"CHIP_BLOCK_F_LAST");
+        end
+        else begin
+            check_flash_constant(ADDR_PROT,PAGE_SIZE,8'hFF,"CHIP_ALLOW_P_FIRST");
+            check_flash_constant(p_last,PAGE_SIZE,8'hFF,"CHIP_ALLOW_P_LAST");
+            check_flash_constant(ADDR_FREE,PAGE_SIZE,8'hFF,"CHIP_ALLOW_F_FIRST");
+            check_flash_constant(f_last,PAGE_SIZE,8'hFF,"CHIP_ALLOW_F_LAST");
+        end
+    endtask
+
+    // [MODIFY] Same structure as #136, but all commands are I2C
+    // master -> I2C-to-SPI bridge -> SPI0 external NVM.
+    virtual task run_address_suite(input logic [23:0] addr,
+                                   input bit expect_block,
+                                   input bit debug_en);
+        check_page_program(addr,expect_block,debug_en);
+        check_fast_read(addr,debug_en);
+        check_region_erase(addr,SECTOR_SIZE,expect_block,debug_en);
+        check_region_erase(addr,BLOCK_SIZE,expect_block,debug_en);
+    endtask
+
+    virtual task run_phase(uvm_phase phase);
+        super.run_phase(phase);
+        phase.raise_objection(this,"Start VPlan 135");
+        `uvm_info(get_type_name(),"[135] START",UVM_LOW)
+
+        // [MODIFY] Use the existing SPI0 bridge initialization.
+        // The inherited preset may force signals; verify it does
+        // not mask the Access Blocking logic being measured.
+        mcu_test_preset();
+        i2c_over_spi_test_preset(SPI_SELECT);
+        nvm_part_start[0]=PART0;
+        nvm_part_start[1]=PART1;
+        nvm_part_start[2]=PART2;
+
+        // [135-1] Matches the original #135 VPlan baseline:
+        // Debug enabled, no protection; PP/SE/BE/CE/read allowed.
+        apply_policy(4'b0000,1'b1);
+        run_address_suite(ADDR_PROT,1'b0,1'b1);
+        check_chip_erase(1'b0,1'b1);
+
+        // [135-2] Debug bypass with a would-be protected range.
+        // Protection bitmap is set, debug bypass should allow.
+        apply_policy(PROT_ON,1'b1);
+        run_address_suite(ADDR_PROT,1'b0,1'b1);
+        check_chip_erase(1'b0,1'b1);
+
+        // [135-3] Protection enabled, debug disabled:
+        // Address in PART1 -> PP/SE/BE blocked; read allowed.
+        // Chip erase blocked globally because PART1 is protected.
+        apply_policy(PROT_ON,1'b0);
+        run_address_suite(ADDR_PROT,1'b1,1'b0);
+        check_chip_erase(1'b1,1'b0);
+
+        // [135-4] Debug disabled but target is outside protection.
+        // Confirm separate initiator/target access rules do not
+        // impose an additional DEBUG=1 gate on this bridge path.
+        apply_policy(PROT_ON,1'b0);
+        run_address_suite(ADDR_FREE,1'b0,1'b0);
+        // No chip erase here: chip erase is global, not per address.
+
+        `uvm_info(get_type_name(),"[135] ALL SCENARIOS COMPLETED",UVM_LOW)
+        phase.drop_objection(this,"Finish VPlan 135");
+    endtask
+endclass
