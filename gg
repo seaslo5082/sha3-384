@@ -139,3 +139,20 @@ Check SW TRNG data is configured correctly.
 Check conditioning operation completes successfully.
 Check conditioning result against the expected value, where applicable.
 Check conditioning_finish can be cleared correctly.
+
+Test Flow
+1. Execute RSA Golden Model self-test to verify the correctness of the RSA calculation.
+2. Generate RSA-3072 test vectors, including plaintext (C), modulus (N), exponent (D), and calculate nprime0.
+3. Calculate the expected RSA result (C^D mod N) using the independent SystemVerilog Golden Model.
+4. Configure C/N/D byte reverse modes and write RSA input registers through AHB.
+5. Trigger RSA computation by setting startCompute = 1 and wait for complete_s.
+6. Configure M_BAR byte reverse mode and read the 3072-bit RSA result through AHB registers.
+7. Execute the following test cases:
+TC0 — Normal Mode: C=0, N=0, D=0, M_BAR=0
+TC1 — C Reverse: C=1, N=0, D=0, M_BAR=0
+TC2 — N Reverse: C=0, N=1, D=0, M_BAR=0
+TC3 — D Reverse: C=0, N=0, D=1, M_BAR=0
+TC4 — All Input Reverse: C=1, N=1, D=1, M_BAR=0
+TC5 — M_BAR Reverse: C=0, N=0, D=0, M_BAR=1
+TC6 — Full Reverse: C=1, N=1, D=1, M_BAR=1
+TC7 — Random Test Vector: Generate multiple random 3072-bit C/N values with configurable D, and execute RSA computation with randomly selected C/N/D/M_BAR byte reverse modes.
