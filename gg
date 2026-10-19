@@ -1,0 +1,141 @@
+Test Flow
+1. Generate RSA-3072 test vectors, including plaintext (C), modulus (N), and exponent (D). Calculate nprime0 based on N.
+2. Calculate the expected RSA result (C^D mod N) using an independent SystemVerilog Golden Model.
+3. Configure c_byte_reverse_mode, n_byte_reverse_mode, and d_byte_reverse_mode to 0 or 1, covering normal, individual reverse, and all-input reverse cases.
+4. Write C, N, D, and nprime0 into RSA registers through AHB, with the input byte ordering adjusted according to each reverse mode.
+5. Set startCompute = 1 to trigger RSA computation and wait for completion.
+6. Configure m_bar_byte_reverse_mode to 0 or 1 and read the 3072-bit RSA result (M_BAR) through AHB registers.
+7. Repeat the verification with different RSA test vectors and byte reverse mode combinations.
+Check
+1. Verify that N is odd and N × nprime0 mod 2^64 = 2^64 − 1.
+2. Verify Golden Model correctness using predefined RSA known-answer self-tests.
+3. Read back C, N, D, and nprime0 registers to verify correct programming and byte reverse mode settings.
+4. Verify that the DUT completes RSA computation and asserts complete_s within the specified timeout.
+5. Verify that C/N/D byte reverse modes preserve the intended logical RSA operands.
+6. Normalize the M_BAR AHB read data according to m_bar_byte_reverse_mode and compare the complete 3072-bit result against the Golden Model.
+7. Verify that all supported RSA byte reverse configurations produce the expected results without mismatches or timeouts.
+
+
+Test Flow / Stimulus Procedure
+1. Initialize MCU test environment and configure SHA3-384 mode by setting D8[1:0] = 2'b10.
+2. Generate input message data and calculate the expected SHA3-384 digest using the SystemVerilog reference model.
+3. Reset SHA engine by asserting FC[6] (reset_hash) and FC[4] (reset_block_tmp). Configure EC[1:0] (reg_block_wr_num) after reset, where each MCU write transfers EC + 1 bytes.
+4. Verify SHA3-384 operation without SALT and MASK (TC0–TC3):
+TC0: Hash the message "abc".
+TC1: Hash a 103-byte message (rate − 1).
+TC2: Hash a 104-byte message (rate boundary).
+TC3: Hash a 105-byte message (rate + 1).
+Set F0[0] = 0 to disable SALT.
+Set FC[7] = 0 to disable MASK.
+Set FC[2] = 1 to enable MCU access.
+Write message data through D4–D7.
+Assert FC[3] (final_trigger) after message transmission and required block processing.
+5. Verify SHA3-384 operation with register SALT (TC4–TC5):
+Set F0[0] = 1 to enable SALT.
+Set F0[1] = 1 to select register SALT.
+Program F8–FB = 32'h12345678.
+TC4: Set F0[2] = 0 to perform SALT + message.
+TC5: Set F0[2] = 1 to perform message + SALT.
+Write message data through MCU access and trigger SHA finalization.
+6. Verify SHA3-384 operation with external OTP SALT (TC6–TC7):
+Set F0[0] = 1 to enable SALT.
+Set F0[1] = 0 to select external OTP SALT.
+TC6: Set F0[2] = 0 to perform SALT + message.
+TC7: Set F0[2] = 1 to perform message + SALT.
+Generate the expected digest using the actual external SALT value.
+Write message data through MCU access and trigger SHA finalization.
+7. Verify SHA3-384 MASK function (TC8):
+Set F0[0] = 0 to disable SALT.
+Generate a 16-byte message containing 00–0F.
+Program MASK data AA BB CC DD into MASK block registers 00–03.
+Set MASK length register 90 = 4.
+Set E0–E7 = 32 bits to start MASK replacement at byte 4.
+Set FC[7] = 1 to enable MASK.
+Write message data through MCU access and trigger SHA finalization.
+8. Verify SHA-local SALT clear function (TC9):
+Configure register SALT using F8–FB.
+Enable SALT in append mode by setting F0[2:0] = 3'b111.
+Assert F4[0] (salt_clr) to clear SHA-local SALT data.
+Observe the internal salt_data signal.
+9. Poll FC[5] (digest_valid) until SHA calculation completes for TC0–TC8. Read the 384-bit SHA digest and compare it against the reference model result.
+10. Repeat verification with the specified test patterns and report PASS/FAIL for each testcase.
+Check
+1. Check SHA3-384 mode configuration by verifying D8[1:0] = 2'b10.
+2. Check SHA reset and MCU access configuration:
+Verify SHA state is initialized before message transmission.
+Check EC[1:0] matches the configured bytes per write.
+Check FC[2] = 1 during MCU access.
+3. Check SHA3-384 reference model correctness using a known-answer test vector.
+4. Check SHA3-384 operation without SALT and MASK (TC0–TC3):
+Verify SALT and MASK functions are disabled.
+Verify correct message length and data order.
+Check SHA rate-boundary handling for 103-, 104-, and 105-byte messages.
+Compare DUT digest with the expected SHA3-384 digest.
+5. Check register SALT operation (TC4–TC5):
+Verify F0[1] = 1 selects register SALT.
+Verify SALT register configuration.
+Check SALT prepend and append operations.
+Compare DUT digest with the corresponding reference model result.
+6. Check external OTP SALT operation (TC6–TC7):
+Verify F0[1] = 0 selects external SALT.
+Check external SALT value and validity.
+Check SALT prepend and append operations.
+Compare DUT digest with the expected result.
+7. Check SHA MASK function (TC8):
+Verify MASK data, length, and start position configuration.
+Check FC[7] = 1.
+Verify bytes 4–7 are replaced with AA BB CC DD.
+Compare DUT digest with the MASK reference digest.
+8. Check SHA-local SALT clear operation (TC9):
+Verify F4[0] generates the salt_clr pulse.
+Check internal salt_data is cleared to 8'h00.
+Verify the clear operation according to the SHA RTL behavior.
+9. Check SHA completion and digest results:
+Verify FC[5] = 1 before reading the digest.
+Check SHA calculation completes without timeout.
+Compare all 384 bits of the DUT digest with the reference model.
+Report PASS/FAIL for each testcase.
+
+151 — TRNG Startup Health Test and Error
+Test Flow
+Configure TRNG startup health test thresholds.
+Enable TRNG and perform normal startup health test.
+Inject FF pattern to trigger Repetition-One Test Failure.
+Inject 00 pattern to trigger Repetition-Zero Test Failure.
+Inject EE pattern to trigger Adaptive Proportion Test Failure.
+Clear error status and verify recovery.
+Check
+Check startup health test completes without error under normal conditions.
+Check TRNG startup state transition.
+Check start_repetition_one_test_fail.
+Check start_repetition_zero_test_fail.
+Check start_adaptation_test_fail.
+Check error status can be cleared correctly.
+152 — TRNG Runtime Health Test and Error
+Test Flow
+Configure TRNG runtime health test thresholds.
+Enable TRNG and perform normal runtime health test.
+Inject FF pattern to trigger Repetition-One Test Failure.
+Inject 00 pattern to trigger Repetition-Zero Test Failure.
+Inject EE pattern to trigger Adaptive Proportion Test Failure.
+Clear error status and verify recovery.
+Check
+Check TRNG enters runtime health test state.
+Check runtime health test operates without error.
+Check repetition_one_test_fail.
+Check repetition_zero_test_fail.
+Check adaptation_test_fail.
+Check error status can be cleared correctly.
+153 — TRNG Conditioning
+Test Flow
+Configure TRNG conditioning registers and debug mode.
+Write 512-bit test data into SW TRNG data registers.
+Trigger TRNG conditioning operation.
+Read conditioning random-number result.
+Clear conditioning completion status.
+Check
+Check TRNG configuration is correct.
+Check SW TRNG data is configured correctly.
+Check conditioning operation completes successfully.
+Check conditioning result against the expected value, where applicable.
+Check conditioning_finish can be cleared correctly.
