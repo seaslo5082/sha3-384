@@ -1,0 +1,178 @@
+virtual task i2c_write_valid_check(
+    input logic [6:0]  i_slv_dev_addr,
+    input logic [31:0] i_addr,
+    input bit          use_amba = 1
+);
+    i2c_check_write_access(i_slv_dev_addr, i_addr, use_amba, 1'b1);
+endtask
+
+virtual task i2c_write_fail_check(
+    input logic [6:0]  i_slv_dev_addr,
+    input logic [31:0] i_addr,
+    input bit          use_amba = 1
+);
+    i2c_check_write_access(i_slv_dev_addr, i_addr, use_amba, 1'b0);
+endtask
+
+virtual task i2c_read_valid_check(
+    input logic [6:0]  i_slv_dev_addr,
+    input logic [31:0] i_addr,
+    input bit          use_amba = 1
+);
+    i2c_check_read_access(i_slv_dev_addr, i_addr, use_amba, 1'b1);
+endtask
+
+virtual task i2c_read_fail_check(
+    input logic [6:0]  i_slv_dev_addr,
+    input logic [31:0] i_addr,
+    input bit          use_amba = 1
+);
+    i2c_check_read_access(i_slv_dev_addr, i_addr, use_amba, 1'b0);
+endtask
+
+local task i2c_check_write_access(
+    input logic [6:0]  dev_addr,
+    input logic [31:0] addr,
+    input bit          use_amba,
+    input bit          expect_write
+);
+    string check_name;
+    logic [31:0] access_mask, writable_mask;
+    logic [31:0] wdata, before_data, after_data, expected_data;
+    logic [7:0] byte_data;
+
+    check_name = expect_write ? "i2c_write_valid_check" : "i2c_write_fail_check";
+
+    // MODIFY 1: Match the payload and compare mask to the transfer width.
+    access_mask = use_amba ? 32'hFFFF_FFFF : 32'h0000_00FF;
+    wdata = (expect_write ? 32'hAAAA_1234 : 32'hCCCC_1234) & access_mask;
+
+    set_mcu_scb_compare(0);
+    set_i2c_scb_compare(0);
+
+    detect_writable_mask(addr, use_amba, writable_mask);
+    writable_mask &= access_mask;
+
+    // MODIFY 2: Capture the baseline after the MCU mask probe.
+    if (!expect_write) begin
+        if (use_amba) begin
+            mcu_word_rd(addr[31:8], addr[7:0], before_data);
+        end else begin
+            mcu_byte_rd(addr[31:8], addr[7:0], byte_data);
+            before_data = {24'b0, byte_data};
+        end
+
+        // An accepted write would flip every monitored bit.
+        if (!$isunknown(writable_mask) &&
+            !$isunknown(before_data & writable_mask))
+            wdata = (wdata & ~writable_mask) | (~before_data & writable_mask);
+    end
+
+    if (use_amba)
+        m_i2c_seq.i2c_over_amba_write(dev_addr, addr, wdata);
+    else
+        i2c_byte_wr(dev_addr, addr, wdata[7:0]);
+
+    #20us;
+    if (use_amba) begin
+        mcu_word_rd(addr[31:8], addr[7:0], after_data);
+    end else begin
+        mcu_byte_rd(addr[31:8], addr[7:0], byte_data);
+        after_data = {24'b0, byte_data};
+    end
+
+    // MODIFY 2: A blocked write must preserve the baseline.
+    expected_data = expect_write ? wdata : before_data;
+    print_control_signals();
+
+    // MODIFY 3: Handle unknown and zero masks explicitly.
+    if ($isunknown(writable_mask)) begin
+        `uvm_error(get_type_name(), $sformatf(
+            "%s SETUP ERROR: addr=0x%08h mode_amba=%0b mask=0x%08h contains X/Z",
+            check_name, addr, use_amba, writable_mask))
+    end else if (writable_mask == 0) begin
+        if (expect_write) begin
+            `uvm_error(get_type_name(), $sformatf(
+                "%s SETUP ERROR: addr=0x%08h mode_amba=%0b has no MCU-proven writable bits",
+                check_name, addr, use_amba))
+        end else if (!$isunknown({before_data, after_data}) &&
+                     before_data != after_data) begin
+            `uvm_error(get_type_name(), $sformatf(
+                "%s FAIL: addr=0x%08h mode_amba=%0b readback changed from 0x%08h to 0x%08h with zero writable mask",
+                check_name, addr, use_amba, before_data, after_data))
+        end else begin
+            `uvm_warning(get_type_name(), $sformatf(
+                "%s INCONCLUSIVE: addr=0x%08h mode_amba=%0b has no MCU-proven writable bits, before=0x%08h after=0x%08h",
+                check_name, addr, use_amba, before_data, after_data))
+        end
+    end else if ($isunknown(expected_data & writable_mask) ||
+                 ((after_data & writable_mask) !== (expected_data & writable_mask))) begin
+        `uvm_error(get_type_name(), $sformatf(
+            "%s FAIL: addr=0x%08h mode_amba=%0b sent=0x%08h readback=0x%08h expected=0x%08h mask=0x%08h",
+            check_name, addr, use_amba, wdata, after_data, expected_data, writable_mask))
+    end else begin
+        `uvm_info(get_type_name(), $sformatf(
+            "%s PASS: addr=0x%08h mode_amba=%0b sent=0x%08h readback=0x%08h expected=0x%08h mask=0x%08h",
+            check_name, addr, use_amba, wdata, after_data, expected_data, writable_mask), UVM_LOW)
+    end
+
+    #1us;
+    set_mcu_scb_compare(1);
+    set_i2c_scb_compare(1);
+endtask
+
+local task i2c_check_read_access(
+    input logic [6:0]  dev_addr,
+    input logic [31:0] addr,
+    input bit          use_amba,
+    input bit          expect_read
+);
+    string check_name;
+    logic [31:0] preload_data, golden_data, i2c_rdata;
+    logic [7:0] mcu_byte_data, i2c_byte_data;
+
+    check_name = expect_read ? "i2c_read_valid_check" : "i2c_read_fail_check";
+    preload_data = expect_read ? 32'h3333_4321 : 32'h5555_4321;
+
+    set_mcu_scb_compare(0);
+    set_i2c_scb_compare(0);
+
+    if (use_amba)
+        mcu_word_wr(addr[31:8], addr[7:0], preload_data);
+    else
+        mcu_byte_wr(addr[31:8], addr[7:0], preload_data[7:0]);
+
+    // MODIFY 4: Capture MCU and I2C byte readback in 8-bit variables.
+    #5us;
+    if (use_amba) begin
+        mcu_word_rd(addr[31:8], addr[7:0], golden_data);
+    end else begin
+        mcu_byte_rd(addr[31:8], addr[7:0], mcu_byte_data);
+        golden_data = {24'b0, mcu_byte_data};
+    end
+
+    #5us;
+    if (use_amba) begin
+        m_i2c_seq.i2c_over_amba_read(dev_addr, addr, i2c_rdata);
+    end else begin
+        i2c_byte_rd(dev_addr, addr, i2c_byte_data);
+        i2c_rdata = {24'b0, i2c_byte_data};
+    end
+
+    print_control_signals();
+
+    if ($isunknown(golden_data) || $isunknown(i2c_rdata) ||
+        ((i2c_rdata == golden_data) != expect_read)) begin
+        `uvm_error(get_type_name(), $sformatf(
+            "%s FAIL: addr=0x%08h mode_amba=%0b i2c=0x%08h mcu=0x%08h",
+            check_name, addr, use_amba, i2c_rdata, golden_data))
+    end else begin
+        `uvm_info(get_type_name(), $sformatf(
+            "%s PASS: addr=0x%08h mode_amba=%0b i2c=0x%08h mcu=0x%08h",
+            check_name, addr, use_amba, i2c_rdata, golden_data), UVM_LOW)
+    end
+
+    #1us;
+    set_mcu_scb_compare(1);
+    set_i2c_scb_compare(1);
+endtask
