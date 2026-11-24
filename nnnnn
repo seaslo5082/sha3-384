@@ -1,0 +1,291 @@
+// MODIFY: Replace the previous run_n9_arbiter_tasks.
+//
+// case_sel:
+//   0 = Run all three cases sequentially
+//   1 = I2C + EXLM -> DLM
+//   2 = I2C + EXLM -> ILM
+//   3 = I2C + EXLM -> N9 registers
+//
+// Each case runs I2C and EXLM concurrently.
+// Both workers finish before the next iteration/case starts.
+//
+// Dependency:
+//   i2c_random_data_rw(slv_dev_addr, addr_que)
+//   Each queue entry accesses exactly one 32-bit word.
+
+virtual task run_n9_arbiter_tasks(
+    input bit          stress_en      = 0,
+    input int unsigned repeat_count   = 100,
+    input time         phase_timeout  = 1s,
+    input int unsigned case_sel       = 0
+);
+    logic [31:0] base_addr;
+    logic [31:0] i2c_first, i2c_last;
+    logic [31:0] exlm_first, exlm_last;
+    logic [31:0] addr_que[$];
+
+    longint unsigned size_bytes;
+    longint unsigned end_exclusive;
+    longint unsigned split_offset;
+
+    int unsigned first_case, last_case;
+    int unsigned loops;
+    int unsigned i2c_word_count;
+    bit [1:0] done;
+
+    if (case_sel > 3)
+        `uvm_fatal("N9_CFG", "case_sel must be 0..3")
+
+    if (phase_timeout == 0)
+        `uvm_fatal("N9_CFG", "phase_timeout must be nonzero")
+
+    if (stress_en &&
+        (repeat_count == 0 || repeat_count > 1000))
+        `uvm_fatal("N9_CFG", "repeat_count must be 1..1000")
+
+    loops      = stress_en ? repeat_count : 1;
+    first_case = (case_sel == 0) ? 1 : case_sel;
+    last_case  = (case_sel == 0) ? 3 : case_sel;
+
+    // Preserve the existing N9 register-model initialization.
+    // Do this before starting concurrent workers.
+    if (case_sel == 0 || case_sel == 3) begin
+        if (!tcon_reg.randomize())
+            `uvm_fatal("N9_CFG", "tcon_reg randomize failed")
+
+        tcon_gen_regmode();
+    end
+
+    for (int unsigned region = first_case;
+         region <= last_case;
+         region++) begin
+
+        case (region)
+            1: begin
+                base_addr  = m_host_top_cfg.mcu_dram_addr_st;
+                size_bytes = m_host_top_cfg.mcu_dram_addr_size;
+            end
+
+            2: begin
+                base_addr  = m_host_top_cfg.mcu_iram_addr_st;
+                size_bytes = m_host_top_cfg.mcu_iram_addr_size;
+            end
+
+            3: begin
+                base_addr  = m_host_top_cfg.andes_reg_addr_st;
+                size_bytes = m_host_top_cfg.andes_reg_addr_size;
+            end
+        endcase
+
+        if ($isunknown(base_addr) || base_addr[1:0] != 0)
+            `uvm_fatal("N9_CFG", "Region base must be word aligned")
+
+        end_exclusive = {32'b0, base_addr} + size_bytes;
+
+        if (size_bytes < 8 ||
+            end_exclusive > 64'h1_0000_0000)
+            `uvm_fatal("N9_CFG", "Invalid region size or address overflow")
+
+        if (region == 3) begin
+            if (size_bytes <= 'h80)
+                `uvm_fatal("N9_CFG", "N9 region must extend beyond offset 0x80")
+
+            // I2C word starts: base+00, +04, ... +40.
+            // Last accessed byte: base+43.
+            i2c_first = base_addr;
+            i2c_last  = base_addr + 'h43;
+
+            // Reserve offsets 44..7F between the workers.
+            exlm_first = base_addr + 'h80;
+            exlm_last  = 32'(end_exclusive - 1);
+        end
+        else begin
+            // Split memory into two word-aligned ranges.
+            split_offset = ((size_bytes / 2) / 4) * 4;
+
+            if (split_offset < 4 ||
+                size_bytes - split_offset < 4)
+                `uvm_fatal("N9_CFG", "Each partition needs at least one word")
+
+            i2c_first = base_addr;
+            i2c_last  = base_addr + 32'(split_offset) - 1;
+
+            exlm_first = base_addr + 32'(split_offset);
+            exlm_last  = 32'(end_exclusive - 1);
+        end
+
+        // Check the complete byte ranges, not only word start addresses.
+        if (i2c_last >= exlm_first)
+            `uvm_fatal("N9_OVERLAP", "I2C and EXLM ranges overlap")
+
+        i2c_word_count =
+            (longint'(i2c_last) - i2c_first + 1) / 4;
+
+        `uvm_info("N9_RANGE", $sformatf(
+            "case=%0d I2C=[%08h:%08h] EXLM=[%08h:%08h]",
+            region, i2c_first, i2c_last,
+            exlm_first, exlm_last), UVM_LOW)
+
+        for (int unsigned iter = 0; iter < loops; iter++) begin
+            addr_que.delete();
+
+            // Five complete words per I2C call.
+            // Every word stays entirely within the I2C partition.
+            for (int unsigned i = 0; i < 5; i++) begin
+                addr_que.push_back(
+                    i2c_first +
+                    4 * $urandom_range(i2c_word_count - 1, 0)
+                );
+            end
+
+            done = '0;
+
+            // Isolate disable fork from unrelated test processes.
+            fork
+                begin
+                    fork
+                        begin
+                            fork
+                                begin : I2C_WORKER
+                                    i2c_random_data_rw(
+                                        slv_dev_addr,
+                                        addr_que
+                                    );
+                                    done[0] = 1'b1;
+                                end
+
+                                begin : EXLM_WORKER
+                                    logic [31:0] addr;
+                                    logic [31:0] actual_word;
+                                    logic [31:0] expected_word[];
+
+                                    logic [7:0] expected_byte;
+                                    logic [7:0] actual_byte;
+                                    logic [7:0] ignore_mask;
+
+                                    int unsigned words;
+                                    int unsigned samples;
+                                    int unsigned word_index;
+
+                                    if (region == 1 || region == 2) begin
+                                        words =
+                                            (longint'(exlm_last) -
+                                             exlm_first + 1) / 4;
+
+                                        samples = (words < 64) ? words : 64;
+                                        expected_word = new[samples];
+
+                                        // Write distinct aligned samples.
+                                        for (int unsigned i = 0;
+                                             i < samples; i++) begin
+
+                                            word_index = (samples == 1) ? 0 :
+                                                (longint'(i) * (words - 1)) /
+                                                (samples - 1);
+
+                                            addr = exlm_first + 4 * word_index;
+                                            expected_word[i] = $urandom;
+
+                                            if (region == 1)
+                                                dlm_word_write_tcon(
+                                                    addr, expected_word[i]);
+                                            else
+                                                ilm_word_write_tcon(
+                                                    addr, expected_word[i]);
+                                        end
+
+                                        // Read the exact same samples.
+                                        for (int unsigned i = 0;
+                                             i < samples; i++) begin
+
+                                            word_index = (samples == 1) ? 0 :
+                                                (longint'(i) * (words - 1)) /
+                                                (samples - 1);
+
+                                            addr = exlm_first + 4 * word_index;
+
+                                            if (region == 1)
+                                                dlm_word_read_tcon(
+                                                    addr, actual_word);
+                                            else
+                                                ilm_word_read_tcon(
+                                                    addr, actual_word);
+
+                                            if (actual_word !== expected_word[i])
+                                                `uvm_error("N9_MEM", $sformatf(
+                                                    "case=%0d iter=%0d addr=%08h exp=%08h got=%08h",
+                                                    region, iter + 1, addr,
+                                                    expected_word[i], actual_word))
+                                        end
+                                    end
+                                    else begin
+                                        // Preserve the original byte register
+                                        // interface and mask conventions.
+                                        for (longint unsigned a = exlm_first;
+                                             a <= exlm_last; a++) begin
+
+                                            addr = 32'(a);
+                                            ignore_mask =
+                                                m_reg_model.full_mask[addr];
+
+                                            expected_byte =
+                                                $urandom &
+                                                m_reg_model.full_rw[addr];
+
+                                            tcon_reg_write(
+                                                addr[15:8], addr[7:0],
+                                                expected_byte);
+
+                                            tcon_reg_read(
+                                                addr[15:8], addr[7:0],
+                                                actual_byte);
+
+                                            if ((actual_byte | ignore_mask) !==
+                                                (expected_byte | ignore_mask))
+                                                `uvm_error("N9_REG", $sformatf(
+                                                    "iter=%0d addr=%08h exp=%02h got=%02h ignore=%02h",
+                                                    iter + 1, addr,
+                                                    expected_byte, actual_byte,
+                                                    ignore_mask))
+                                        end
+                                    end
+
+                                    done[1] = 1'b1;
+                                end
+                            join
+                        end
+
+                        begin
+                            #(phase_timeout);
+
+                            if (done !== 2'b11)
+                                `uvm_fatal("N9_TIMEOUT", $sformatf(
+                                    "case=%0d iter=%0d done{EXLM,I2C}=%b",
+                                    region, iter + 1, done))
+                        end
+                    join_any
+
+                    disable fork;
+                end
+            join
+
+            if (done !== 2'b11)
+                `uvm_fatal("N9_INCOMPLETE", "Both workers must complete")
+
+            `uvm_info("N9_ARB", $sformatf(
+                "case=%0d iteration=%0d/%0d completed",
+                region, iter + 1, loops), UVM_LOW)
+        end
+    end
+endtask
+
+mcu_test_preset();
+i2c_test_preset();
+mcu_set_host_arbiter(1);
+
+run_n9_arbiter_tasks(
+    .stress_en    (1),
+    .repeat_count (100),
+    .phase_timeout(1s),
+    .case_sel     (0)
+);
